@@ -46,12 +46,16 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
     required_paths = {
         "/healthz",
         "/metrics",
+        "/metrics/prometheus",
+        "/oauth/token",
         "/api/v1/layers",
         "/api/v1/layers/{layer_id}",
         "/api/v1/layers/{layer_id}/legend",
         "/api/v1/layers/{layer_id}/legend/image",
         "/api/v1/security/check-url",
         "/api/v1/security/allowlist",
+        "/api/v1/admin/keys",
+        "/api/v1/admin/keys/{key_id}",
     }
     assert required_paths <= set(schema["paths"])
     # Layers list declares API key security via dependency; schema must list the path.
@@ -261,3 +265,99 @@ def test_rate_limit_per_api_key(
     assert body["code"] == "rate_limited"
     assert "Retry-After" in limited.headers
     assert "X-RateLimit-Limit" in limited.headers
+    assert limited.headers.get("X-RateLimit-Backend") == "memory"
+
+
+def test_admin_keys_create_list_revoke(
+    client: TestClient, admin_headers: dict[str, str], auth_headers: dict[str, str]
+) -> None:
+    """Admin key management requires admin:keys; secret shown once."""
+    denied = client.get("/api/v1/admin/keys", headers=auth_headers)
+    assert denied.status_code == 403
+
+    created = client.post(
+        "/api/v1/admin/keys",
+        headers=admin_headers,
+        json={
+            "key_id": "partner-a",
+            "scopes": ["layers:read"],
+            "label": "Partner A sandbox",
+        },
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["key_id"] == "partner-a"
+    assert body["secret"].startswith("zenith_")
+    secret = body["secret"]
+
+    listed = client.get("/api/v1/admin/keys", headers=admin_headers)
+    assert listed.status_code == 200
+    ids = {item["key_id"] for item in listed.json()["items"]}
+    assert "partner-a" in ids
+    assert all("secret" not in item for item in listed.json()["items"])
+
+    # New key can call catalog.
+    ok = client.get("/api/v1/layers", headers={"X-API-Key": secret})
+    assert ok.status_code == 200
+
+    revoked = client.delete("/api/v1/admin/keys/partner-a", headers=admin_headers)
+    assert revoked.status_code == 200
+    assert revoked.json()["revoked"] is True
+
+    blocked = client.get("/api/v1/layers", headers={"X-API-Key": secret})
+    assert blocked.status_code == 401
+
+
+def test_oauth_client_credentials_and_bearer(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    token_resp = client.post(
+        "/oauth/token",
+        json={
+            "grant_type": "client_credentials",
+            "client_id": "demo",
+            "client_secret": "zenith_demo_key_layers_read",
+        },
+    )
+    assert token_resp.status_code == 200
+    token_body = token_resp.json()
+    assert token_body["token_type"] == "Bearer"
+    assert token_body["access_token"]
+    assert "layers:read" in token_body["scope"]
+
+    layers = client.get(
+        "/api/v1/layers",
+        headers={"Authorization": f"Bearer {token_body['access_token']}"},
+    )
+    assert layers.status_code == 200
+
+    bad = client.post(
+        "/oauth/token",
+        json={
+            "grant_type": "authorization_code",
+            "client_id": "demo",
+            "client_secret": "zenith_demo_key_layers_read",
+        },
+    )
+    assert bad.status_code == 400
+    assert bad.json()["code"] == "unsupported_grant_type"
+
+    # API key path still works alongside OAuth.
+    assert client.get("/api/v1/layers", headers=auth_headers).status_code == 200
+
+
+def test_prometheus_metrics_endpoint(client: TestClient) -> None:
+    client.get("/healthz")
+    response = client.get("/metrics/prometheus")
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+    text = response.text
+    assert "zenith_http_requests_total" in text or "zenith_api_up" in text
+
+
+def test_rate_limit_backend_header(client: TestClient, auth_headers: dict[str, str]) -> None:
+    response = client.get("/api/v1/layers", headers=auth_headers)
+    assert response.status_code == 200
+    assert response.headers.get("X-RateLimit-Backend") == "memory"
+    health = client.get("/healthz").json()
+    assert health["metrics"]["rate_limit_backend"] == "memory"

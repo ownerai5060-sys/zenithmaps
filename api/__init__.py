@@ -4,4 +4,4 @@ Streamlit pages under the repo root remain a UI demo; this package is the
 stable HTTP surface for external applications.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

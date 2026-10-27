@@ -1,4 +1,4 @@
-"""Zenith Maps Platform API entrypoint (M1–M7 + S1–S3).
+"""Zenith Maps Platform API entrypoint (M1–M7 + S1–S6 + production readiness).
 
 Architecture decision (M1)
 --------------------------
@@ -37,9 +37,12 @@ from api.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
+from api.keystore import get_keystore
 from api.metrics import get_metrics
-from api.rate_limit import RateLimitHeaderMiddleware
-from api.routers import health, layers, security
+from api.oauth import get_token_store
+from api.otel import setup_otel
+from api.rate_limit import RateLimitHeaderMiddleware, reset_rate_limiter
+from api.routers import admin_keys, health, layers, oauth, security
 
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
@@ -55,22 +58,30 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
-    """Record per-request latency and error counts (S2)."""
+    """Record per-request latency and error counts (S2 + Prometheus)."""
 
     async def dispatch(self, request: Request, call_next):
         started = time.perf_counter()
         response = await call_next(request)
         latency_ms = (time.perf_counter() - started) * 1000
         is_error = response.status_code >= 500
-        get_metrics().record(latency_ms=latency_ms, is_error=is_error)
+        get_metrics().record(
+            latency_ms=latency_ms,
+            is_error=is_error,
+            path=request.url.path,
+        )
         return response
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
     # Eagerly load settings so misconfigured env fails at startup.
-    get_settings()
+    settings = get_settings()
     get_metrics().reset()
+    get_keystore().reset_and_seed(settings.api_keys)
+    get_token_store().reset()
+    reset_rate_limiter(settings)
+    setup_otel(app, settings)
     yield
 
 
@@ -81,8 +92,9 @@ def create_app() -> FastAPI:
         version=__version__,
         description=(
             "Stable HTTP API for Zenith Maps catalog, layer metadata, structured "
-            "legends, and allowlisted GetLegendGraphic. Streamlit pages in this "
-            "repo are a UI demo; external apps should integrate against `/api/v1`."
+            "legends, allowlisted GetLegendGraphic, admin key management, and an "
+            "OAuth2 client-credentials stub. Streamlit pages in this repo are a UI "
+            "demo; external apps should integrate against `/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -94,13 +106,19 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-API-Key",
+            "X-Request-ID",
+        ],
         expose_headers=[
             REQUEST_ID_HEADER,
             "X-RateLimit-Limit",
             "X-RateLimit-Remaining",
             "X-RateLimit-Reset",
+            "X-RateLimit-Backend",
             "Retry-After",
         ],
     )
@@ -117,8 +135,10 @@ def create_app() -> FastAPI:
     application.add_exception_handler(Exception, unhandled_exception_handler)
 
     application.include_router(health.router)
+    application.include_router(oauth.router)
     application.include_router(layers.router, prefix="/api/v1")
     application.include_router(security.router, prefix="/api/v1")
+    application.include_router(admin_keys.router, prefix="/api/v1")
 
     @application.get("/api/v1", include_in_schema=True, tags=["meta"])
     async def api_v1_root(request: Request) -> JSONResponse:
@@ -135,8 +155,11 @@ def create_app() -> FastAPI:
                     "legend_image": "/api/v1/layers/{layer_id}/legend/image",
                     "check_url": "/api/v1/security/check-url",
                     "allowlist": "/api/v1/security/allowlist",
+                    "admin_keys": "/api/v1/admin/keys",
+                    "oauth_token": "/oauth/token",
                     "healthz": "/healthz",
                     "metrics": "/metrics",
+                    "metrics_prometheus": "/metrics/prometheus",
                 },
                 "request_id": get_request_id(request),
             },
