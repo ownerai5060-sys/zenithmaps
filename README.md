@@ -16,7 +16,11 @@ for external applications.
 | خروجی Postman / OpenAPI | `python scripts/export_openapi_collection.py` |
 
 این مخزن **سرویس کاشی اختصاصی زنیت (WMTS/CDN) ندارد** و **GraphQL ندارد**
-(عمداً به تعویق افتاده). کاشی‌ها فقط همان URLهای allowlist‌شدهٔ کاتالوگ هستند.
+(عمداً به تعویق افتاده). کاشی‌ها فقط URLهای allowlist‌شدهٔ کاتالوگ هستند؛
+سیاست CDN: `docs/tile-cdn-policy.md` و env اختیاری `ZENITH_TILE_CDN_BASE_URLS`.
+
+**وضعیت آمادگی API:** `staging-ready` (sandbox / پروتوتایپ خارجی). موارد فقط‑پروداکشن
+در گزارش readiness باقی مانده‌اند (IdP واقعی، SLA، CDN عملیاتی، worker مدیریت‌شده).
 
 ---
 
@@ -46,11 +50,13 @@ uvicorn api.main:app --reload --port 8000
 - Allowlisted tile templates (N4): `GET /api/v1/tiles`
 - Admin webhooks + delivery log: `POST /api/v1/admin/webhooks`, `GET .../deliveries`
 - Durable webhook registry + retry queue: set `ZENITH_WEBHOOK_LOG_PATH` (SQLite); drain with `python -m api.webhook_worker`
-- PostGIS WFS-lite schema: `sql/001_zenith_features.sql` (optional; `psycopg` pinned)
+- PostGIS WFS-lite schema: `python -m api.migrate` (or `sql/001_zenith_features.sql`; `psycopg` pinned)
 - Durable key vault: set `ZENITH_KEY_VAULT_PATH` (SQLite) so admin-created keys survive restart
 - Key portal UI: `/admin/key-portal` (static HTML) or Streamlit page `pages/8_🔑_API_Keys.py`
-- Portal SSO (PKCE S256): `/oauth/portal/login` → HttpOnly cookie (no pasted admin key)
+- Portal SSO (PKCE S256): `/oauth/portal/login` → HttpOnly session + CSRF double-submit cookie
 - Light RBAC: `keys:read` (list) vs `admin:keys` (create/revoke/rotate); `POST .../keys/{id}/rotate`
+- Webhook egress: soft SSRF blocks + optional `ZENITH_WEBHOOK_ALLOWED_HOSTS`
+- Tile CDN policy stub: `ZENITH_TILE_CDN_BASE_URLS` (allowlist only; no hosted CDN)
 - OAuth/OIDC: `/oauth/token` supports `client_credentials`, `authorization_code`, `refresh_token`
   with PKCE S256; `/oauth/authorize` + `/oauth/callback` stub locally or proxy to IdP via `ZENITH_OIDC_*`
 - Optional OIDC JWT Bearer: set `ZENITH_OIDC_JWKS_URL` (+ audience/issuer)

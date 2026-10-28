@@ -449,6 +449,8 @@ def test_tiles_catalog_allowlisted(
     assert listed.status_code == 200
     body = listed.json()
     assert body["zenith_hosts_tiles"] is False
+    assert body["cdn_policy"]["zenith_hosts_tiles"] is False
+    assert body["cdn_policy"]["env_var"] == "ZENITH_TILE_CDN_BASE_URLS"
     assert body["count"] >= 1
     ids = {item["layer_id"] for item in body["items"]}
     assert "opentopomap" in ids
@@ -464,6 +466,27 @@ def test_tiles_catalog_allowlisted(
     no_tiles = client.get("/api/v1/tiles/esa-worldcover-2020", headers=auth_headers)
     assert no_tiles.status_code == 404
     assert no_tiles.json()["code"] == "tiles_not_available"
+
+
+def test_tile_cdn_base_url_allowlist(
+    client: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CDN policy env allowlists partner bases without inventing CDN infra."""
+    monkeypatch.setenv(
+        "ZENITH_TILE_CDN_BASE_URLS", "https://cdn.partner.example"
+    )
+    get_settings.cache_clear()
+    from api.main import create_app
+
+    with TestClient(create_app()) as c:
+        body = c.get("/api/v1/tiles", headers=auth_headers).json()
+        assert "https://cdn.partner.example" in body["cdn_policy"][
+            "allowlisted_cdn_base_urls"
+        ]
+        root = c.get("/api/v1").json()
+        assert root["readiness"] == "staging-ready"
+        assert root["tile_cdn"]["zenith_hosts_tiles"] is False
+    get_settings.cache_clear()
 
 
 def test_webhooks_register_and_catalog_bump(
@@ -708,7 +731,7 @@ def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
     assert "admin_webhook_deliveries" in body["endpoints"]
     assert body["webhook_registry_durable"] is True
     assert body["webhook_retry_enabled"] is True
-    assert body["package_version"] == "0.8.0"
+    assert body["package_version"] == "0.9.0"
 
 
 def test_webhook_registry_survives_reconfigure(
@@ -1160,6 +1183,7 @@ def test_portal_login_sets_session_cookie(client: TestClient) -> None:
     assert cfg.status_code == 200
     assert cfg.json()["pkce"]["methods"] == ["S256"]
     assert "portal_login" in cfg.json()
+    assert cfg.json()["portal_cookies"]["csrf_enabled"] is True
 
     # follow_redirects: login → callback → key-portal; cookie jar keeps session.
     landed = client.get(
@@ -1169,6 +1193,8 @@ def test_portal_login_sets_session_cookie(client: TestClient) -> None:
     )
     assert landed.status_code in {200, 307}
     assert client.cookies.get("zenith_portal_token")
+    csrf = client.cookies.get("zenith_portal_csrf")
+    assert csrf
 
     session = client.get("/oauth/portal/session")
     assert session.status_code == 200
@@ -1181,9 +1207,92 @@ def test_portal_login_sets_session_cookie(client: TestClient) -> None:
     listed = client.get("/api/v1/admin/keys")
     assert listed.status_code == 200
 
+    # Cookie-auth mutation without CSRF header → 403.
+    bad = client.post(
+        "/api/v1/admin/keys",
+        json={"key_id": "csrf-denied", "scopes": ["layers:read"]},
+    )
+    assert bad.status_code == 403
+    assert bad.json()["code"] == "csrf_failed"
+
+    ok = client.post(
+        "/api/v1/admin/keys",
+        headers={"X-CSRF-Token": csrf},
+        json={"key_id": "csrf-ok", "scopes": ["layers:read"]},
+    )
+    assert ok.status_code == 201
+    assert ok.json()["key_id"] == "csrf-ok"
+
     logout = client.post("/oauth/portal/logout")
     assert logout.status_code == 200
     assert client.get("/oauth/portal/session").status_code == 401
+
+
+def test_webhook_egress_blocks_private_and_respects_allowlist(
+    client: TestClient, admin_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SSRF hardening: private IPs blocked; optional host allowlist enforced."""
+    blocked = client.post(
+        "/api/v1/admin/webhooks",
+        headers=admin_headers,
+        json={"url": "https://10.0.0.5/hook", "events": ["webhook.ping"]},
+    )
+    assert blocked.status_code == 400
+
+    meta = client.post(
+        "/api/v1/admin/webhooks",
+        headers=admin_headers,
+        json={
+            "url": "https://169.254.169.254/latest/meta-data",
+            "events": ["webhook.ping"],
+        },
+    )
+    assert meta.status_code == 400
+
+    monkeypatch.setenv("ZENITH_WEBHOOK_ALLOWED_HOSTS", "hooks.partner.example")
+    get_settings.cache_clear()
+    from api.main import create_app
+
+    with TestClient(create_app()) as c:
+        denied = c.post(
+            "/api/v1/admin/webhooks",
+            headers=admin_headers,
+            json={
+                "url": "https://example.com/zenith-hook",
+                "events": ["webhook.ping"],
+            },
+        )
+        assert denied.status_code == 400
+        assert "allowlist" in denied.json()["message"].lower()
+
+        allowed = c.post(
+            "/api/v1/admin/webhooks",
+            headers=admin_headers,
+            json={
+                "url": "https://hooks.partner.example/zenith",
+                "events": ["webhook.ping"],
+                "webhook_id": "wh-allow",
+            },
+        )
+        assert allowed.status_code == 201
+    get_settings.cache_clear()
+
+
+def test_migrate_lists_sql_and_exits_without_dsn(tmp_path) -> None:
+    """Lightweight migration runner discovers NNN_*.sql; no DSN → exit 2."""
+    from api.migrate import list_migration_files, main
+
+    files = list_migration_files()
+    assert any(name == "001" for name, _ in files)
+    assert any(p.name == "001_zenith_features.sql" for _, p in files)
+
+    # Tiny local sql dir still discovered.
+    sample = tmp_path / "002_demo.sql"
+    sample.write_text("-- demo\nSELECT 1;\n", encoding="utf-8")
+    local = list_migration_files(tmp_path)
+    assert local == [("002", sample)]
+
+    assert main(["--dry-run"]) == 2
 
 
 def test_oauth_authorize_idp_includes_pkce(

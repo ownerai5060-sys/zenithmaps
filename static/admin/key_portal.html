@@ -258,13 +258,29 @@
       el.className = "msg show " + (ok ? "ok" : "err");
     }
 
-    function headers() {
+    function readCookie(name) {
+      const parts = ("; " + document.cookie).split("; " + name + "=");
+      if (parts.length === 2) {
+        return decodeURIComponent(parts.pop().split(";").shift() || "");
+      }
+      return "";
+    }
+
+    function headers(method) {
       const h = {
         "Accept": "application/json",
         "Content-Type": "application/json",
       };
       const key = $("adminKey").value.trim();
       if (key) h["X-API-Key"] = key;
+      // Double-submit CSRF for cookie-auth mutations (session is HttpOnly).
+      const unsafe = !method || ["POST", "PUT", "PATCH", "DELETE"].includes(
+        String(method).toUpperCase()
+      );
+      if (unsafe && !key) {
+        const csrf = readCookie("zenith_portal_csrf");
+        if (csrf) h["X-CSRF-Token"] = csrf;
+      }
       return h;
     }
 
@@ -272,7 +288,7 @@
       const base = $("baseUrl").value.replace(/\/$/, "");
       const res = await fetch(base + path, {
         method,
-        headers: headers(),
+        headers: headers(method),
         credentials: "include",
         body: body ? JSON.stringify(body) : undefined,
       });

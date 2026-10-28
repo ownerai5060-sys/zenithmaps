@@ -144,10 +144,24 @@ class TileLayerInfo(BaseModel):
     notes: Optional[str] = None
 
 
+class TileCdnPolicy(BaseModel):
+    """Zenith tile CDN policy stub — no hosted CDN infrastructure."""
+
+    zenith_hosts_tiles: bool = False
+    allowlisted_cdn_base_urls: list[str] = Field(default_factory=list)
+    env_var: str = "ZENITH_TILE_CDN_BASE_URLS"
+    notes: str = (
+        "Zenith does not operate a WMTS/XYZ CDN. Set ZENITH_TILE_CDN_BASE_URLS "
+        "to document/allowlist optional partner CDN bases only — this API never "
+        "proxies or invents open public CDN endpoints."
+    )
+
+
 class TileListResponse(BaseModel):
     items: list[TileLayerInfo]
     count: int
     zenith_hosts_tiles: bool = False
+    cdn_policy: Optional[TileCdnPolicy] = None
     notes: Optional[str] = None
 
 
