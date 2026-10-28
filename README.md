@@ -45,6 +45,8 @@ uvicorn api.main:app --reload --port 8000
 - WFS-lite features: `GET /api/v1/layers/{id}/features` (fixtures; optional PostGIS via `ZENITH_DATABASE_URL`)
 - Allowlisted tile templates (N4): `GET /api/v1/tiles`
 - Admin webhooks + delivery log: `POST /api/v1/admin/webhooks`, `GET .../deliveries`
+- Durable webhook registry + retry queue: set `ZENITH_WEBHOOK_LOG_PATH` (SQLite); drain with `python -m api.webhook_worker`
+- PostGIS WFS-lite schema: `sql/001_zenith_features.sql` (optional; `psycopg` pinned)
 - Durable key vault: set `ZENITH_KEY_VAULT_PATH` (SQLite) so admin-created keys survive restart
 - Optional OIDC JWT: set `ZENITH_OIDC_JWKS_URL` (+ audience/issuer) alongside opaque `/oauth/token`
 

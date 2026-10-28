@@ -55,6 +55,7 @@ from api.routers import (
     webhooks,
 )
 from api.webhook_log import get_delivery_log
+from api.webhook_retry import get_retry_queue
 from api.webhooks import get_webhook_registry
 
 
@@ -94,8 +95,10 @@ async def lifespan(app: FastAPI):
     get_keystore().reset_and_seed(settings.api_keys)
     get_token_store().reset()
     get_jwks_cache().reset()
-    get_webhook_registry().reset()
+    # Shared SQLite: subscriptions + delivery log + retry queue.
     get_delivery_log().configure(settings.webhook_log_path)
+    get_webhook_registry().configure(settings.webhook_log_path)
+    get_retry_queue().configure(settings.webhook_log_path)
     reset_catalog_version(1)
     reset_rate_limiter(settings)
     setup_otel(app, settings)
@@ -111,11 +114,11 @@ def create_app() -> FastAPI:
             "Stable HTTP API for Zenith Maps catalog, layer metadata, structured "
             "legends, allowlisted GetLegendGraphic, WFS-lite GeoJSON features "
             "(fixtures / optional PostGIS), allowlisted catalog tile URL "
-            "discovery, durable API-key vault, catalog webhooks with delivery "
-            "log + HMAC stub, OAuth2 client-credentials stub, and optional "
-            "OIDC JWT (JWKS) Bearer validation. GraphQL is deferred. Streamlit "
-            "pages in this repo are a UI demo; external apps should integrate "
-            "against `/api/v1`."
+            "discovery, durable API-key vault, catalog webhooks with durable "
+            "subscription registry + delivery/retry log + HMAC stub, OAuth2 "
+            "client-credentials stub, and optional OIDC JWT (JWKS) Bearer "
+            "validation. GraphQL is deferred. Streamlit pages in this repo are "
+            "a UI demo; external apps should integrate against `/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -200,6 +203,8 @@ def create_app() -> FastAPI:
                 "features_mode": "wfs_lite",
                 "key_vault_durable": bool(settings.key_vault_path),
                 "webhook_log_durable": bool(settings.webhook_log_path),
+                "webhook_registry_durable": bool(settings.webhook_log_path),
+                "webhook_retry_enabled": bool(settings.webhook_retry_enabled),
                 "request_id": get_request_id(request),
             },
             headers={REQUEST_ID_HEADER: get_request_id(request)},

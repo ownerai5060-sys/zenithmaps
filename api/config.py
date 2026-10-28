@@ -92,8 +92,14 @@ class Settings:
     oidc_issuer: str = ""
     oidc_default_scopes: str = "layers:read"
     # Webhook durability + HMAC signing stub.
+    # Same SQLite path holds subscriptions, delivery log, and retry queue.
     webhook_log_path: str = ""
     webhook_signing_secret: str = ""
+    # Retry worker (exponential backoff for failed deliveries).
+    webhook_retry_enabled: bool = True
+    webhook_retry_max_attempts: int = 5
+    webhook_retry_base_delay_s: float = 2.0
+    webhook_retry_max_delay_s: float = 300.0
 
 
 def _parse_csv(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -160,6 +166,13 @@ def _int(name: str, default: int) -> int:
     if raw is None or raw.strip() == "":
         return default
     return int(raw)
+
+
+def _float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
 
 
 @lru_cache(maxsize=1)
@@ -232,4 +245,8 @@ def get_settings() -> Settings:
         ),
         webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
         webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
+        webhook_retry_enabled=_bool("ZENITH_WEBHOOK_RETRY_ENABLED", True),
+        webhook_retry_max_attempts=_int("ZENITH_WEBHOOK_RETRY_MAX_ATTEMPTS", 5),
+        webhook_retry_base_delay_s=_float("ZENITH_WEBHOOK_RETRY_BASE_DELAY_S", 2.0),
+        webhook_retry_max_delay_s=_float("ZENITH_WEBHOOK_RETRY_MAX_DELAY_S", 300.0),
     )
