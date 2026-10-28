@@ -22,6 +22,7 @@ from api.oauth import get_token_store  # noqa: E402
 from api.oidc import get_jwks_cache  # noqa: E402
 from api.rate_limit import get_rate_limiter, reset_rate_limiter  # noqa: E402
 from api.webhook_log import get_delivery_log  # noqa: E402
+from api.webhook_retry import get_retry_queue  # noqa: E402
 from api.webhooks import get_webhook_registry  # noqa: E402
 
 DEMO_API_KEY = "zenith_demo_key_layers_read"
@@ -57,8 +58,11 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     get_token_store().reset()
     get_jwks_cache().reset()
     get_keystore().reset_and_seed()
-    get_webhook_registry().reset()
     get_delivery_log().configure(str(whlog))
+    get_webhook_registry().configure(str(whlog))
+    get_retry_queue().configure(str(whlog))
+    get_webhook_registry().reset()
+    get_retry_queue().reset()
     get_delivery_log().reset()
     reset_catalog_version(1)
     yield
@@ -70,6 +74,7 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     get_jwks_cache().reset()
     get_keystore().reset_and_seed()
     get_webhook_registry().reset()
+    get_retry_queue().reset()
     get_delivery_log().reset()
     reset_catalog_version(1)
 

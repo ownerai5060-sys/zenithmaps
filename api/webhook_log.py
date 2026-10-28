@@ -3,19 +3,21 @@
 When ``ZENITH_WEBHOOK_LOG_PATH`` is set, each delivery attempt is appended to a
 SQLite table so operators can audit pings across restarts. Empty path keeps an
 in-memory ring buffer (tests / ephemeral demos).
+
+Shares the SQLite file with the subscription registry and retry queue
+(see ``api.webhook_store``).
 """
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from api.config import get_settings
+from api.webhook_store import connect, ensure_schema
 
 
 @dataclass
@@ -52,48 +54,17 @@ class DeliveryLog:
         with self._lock:
             self._path = (path or "").strip()
             if self._path:
-                self._ensure_schema()
+                with connect(self._path) as conn:
+                    ensure_schema(conn)
 
     def reset(self) -> None:
         with self._lock:
             self._memory.clear()
             if self._path:
-                path = Path(self._path)
-                if path.is_file():
-                    path.unlink(missing_ok=True)
-                self._ensure_schema()
-
-    def _connect(self) -> sqlite3.Connection:
-        path = Path(self._path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _ensure_schema(self) -> None:
-        if not self._path:
-            return
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                    id TEXT PRIMARY KEY,
-                    webhook_id TEXT NOT NULL,
-                    event TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    http_status INTEGER,
-                    error TEXT,
-                    occurred_at REAL NOT NULL,
-                    signature_header TEXT
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_wh_del_time "
-                "ON webhook_deliveries(occurred_at DESC)"
-            )
-            conn.commit()
+                with connect(self._path) as conn:
+                    ensure_schema(conn)
+                    conn.execute("DELETE FROM webhook_deliveries")
+                    conn.commit()
 
     def append(
         self,
@@ -125,8 +96,8 @@ class DeliveryLog:
             if len(self._memory) > self._memory_limit:
                 self._memory = self._memory[-self._memory_limit :]
             if path:
-                self._ensure_schema()
-                with self._connect() as conn:
+                with connect(path) as conn:
+                    ensure_schema(conn)
                     conn.execute(
                         """
                         INSERT INTO webhook_deliveries
@@ -160,16 +131,16 @@ class DeliveryLog:
         with self._lock:
             self._path = path
             if path:
-                self._ensure_schema()
-                sql = (
-                    "SELECT * FROM webhook_deliveries"
-                    + (" WHERE webhook_id = ?" if webhook_id else "")
-                    + " ORDER BY occurred_at DESC LIMIT ?"
-                )
-                params: tuple[Any, ...] = (
-                    (webhook_id, limit) if webhook_id else (limit,)
-                )
-                with self._connect() as conn:
+                with connect(path) as conn:
+                    ensure_schema(conn)
+                    sql = (
+                        "SELECT * FROM webhook_deliveries"
+                        + (" WHERE webhook_id = ?" if webhook_id else "")
+                        + " ORDER BY occurred_at DESC LIMIT ?"
+                    )
+                    params: tuple[Any, ...] = (
+                        (webhook_id, limit) if webhook_id else (limit,)
+                    )
                     rows = conn.execute(sql, params).fetchall()
                 return [
                     DeliveryRecord(

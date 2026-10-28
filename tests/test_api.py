@@ -1,4 +1,4 @@
-"""Acceptance tests for M2–N6 + WFS-lite / vault / OIDC / webhook durability."""
+"""Acceptance tests for M2–N6 + WFS-lite / vault / OIDC / webhook ops."""
 
 from __future__ import annotations
 
@@ -6,6 +6,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+from api.config import get_settings
+from api.webhook_log import get_delivery_log
+from api.webhook_retry import get_retry_queue
 
 
 def test_healthz(client: TestClient) -> None:
@@ -690,3 +694,135 @@ def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
     assert body["features_mode"] == "wfs_lite"
     assert body["auth"]["api_key"] == "X-API-Key"
     assert "admin_webhook_deliveries" in body["endpoints"]
+    assert body["webhook_registry_durable"] is True
+    assert body["webhook_retry_enabled"] is True
+
+
+def test_webhook_registry_survives_reconfigure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, admin_headers: dict[str, str]
+) -> None:
+    """Ops: subscriptions persist in the shared webhook SQLite file."""
+    from api.main import create_app
+    from api.webhooks import get_webhook_registry
+
+    whdb = tmp_path / "webhooks.sqlite"
+    monkeypatch.setenv("ZENITH_WEBHOOK_LOG_PATH", str(whdb))
+    get_settings.cache_clear()
+    get_delivery_log().configure(str(whdb))
+    get_webhook_registry().configure(str(whdb))
+    get_retry_queue().configure(str(whdb))
+
+    app = create_app()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/admin/webhooks",
+            headers=admin_headers,
+            json={
+                "url": "https://example.com/durable-hook",
+                "events": ["catalog.updated"],
+                "webhook_id": "wh-durable",
+                "label": "Durable",
+            },
+        )
+        assert created.status_code == 201
+
+    # New process-equivalent: reconfigure registry from the same SQLite path.
+    get_webhook_registry().configure(str(whdb))
+    sub = get_webhook_registry().get("wh-durable")
+    assert sub is not None
+    assert sub.active is True
+    assert sub.url == "https://example.com/durable-hook"
+    listed = get_webhook_registry().list()
+    assert any(w.id == "wh-durable" for w in listed)
+
+
+def test_webhook_retry_backoff_and_worker(
+    monkeypatch: pytest.MonkeyPatch, admin_headers: dict[str, str]
+) -> None:
+    """Failed deliveries enqueue; worker retries with exponential backoff."""
+    from api.main import create_app
+    from api.webhook_retry import (
+        compute_backoff_s,
+        get_retry_queue,
+        process_due_retries,
+    )
+    from api.webhooks import get_webhook_registry
+
+    assert compute_backoff_s(1, base_delay_s=2.0) == 2.0
+    assert compute_backoff_s(2, base_delay_s=2.0) == 4.0
+    assert compute_backoff_s(3, base_delay_s=2.0) == 8.0
+    assert compute_backoff_s(10, base_delay_s=2.0, max_delay_s=30.0) == 30.0
+
+    monkeypatch.setenv("ZENITH_WEBHOOK_RETRY_BASE_DELAY_S", "0.01")
+    monkeypatch.setenv("ZENITH_WEBHOOK_RETRY_MAX_ATTEMPTS", "3")
+    get_settings.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/admin/webhooks",
+            headers=admin_headers,
+            json={
+                "url": "https://example.com/retry-hook",
+                "events": ["catalog.updated"],
+                "webhook_id": "wh-retry",
+            },
+        )
+        assert created.status_code == 201
+
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+
+        with patch("api.webhooks.httpx.Client") as client_cls:
+            mock_http = MagicMock()
+            mock_http.post.return_value = mock_response
+            mock_http.__enter__ = MagicMock(return_value=mock_http)
+            mock_http.__exit__ = MagicMock(return_value=False)
+            client_cls.return_value = mock_http
+
+            bumped = client.post(
+                "/api/v1/admin/catalog/bump",
+                headers=admin_headers,
+                json={"reason": "force-fail"},
+            )
+            assert bumped.status_code == 200
+            assert bumped.json()["webhook"]["succeeded"] == 0
+
+        pending = get_retry_queue().list_pending()
+        assert len(pending) == 1
+        assert pending[0].webhook_id == "wh-retry"
+        assert pending[0].attempt_count == 1
+
+        # Make the job due immediately and succeed on retry.
+        job = pending[0]
+        get_retry_queue().reschedule(job, error="force-due")
+        # Overwrite next_retry_at by marking due via process with now far future
+        # — re-read and force due by calling process_due_retries with now large.
+        due_now = job.next_retry_at + 10_000
+
+        ok_response = MagicMock()
+        ok_response.status_code = 204
+        with patch("api.webhook_retry.httpx.Client") as retry_cls:
+            mock_retry = MagicMock()
+            mock_retry.post.return_value = ok_response
+            mock_retry.__enter__ = MagicMock(return_value=mock_retry)
+            mock_retry.__exit__ = MagicMock(return_value=False)
+            retry_cls.return_value = mock_retry
+
+            # First force the pending job's next_retry_at into the past.
+            from api.webhook_store import connect
+
+            path = get_retry_queue().path
+            with connect(path) as conn:
+                conn.execute(
+                    "UPDATE webhook_retry_queue SET next_retry_at = 0, "
+                    "attempt_count = 1, status = 'pending'"
+                )
+                conn.commit()
+
+            stats = process_due_retries(now=due_now, client=mock_retry)
+            assert stats["attempted"] == 1
+            assert stats["succeeded"] == 1
+
+        assert get_retry_queue().list_pending() == []
+        assert get_webhook_registry().get("wh-retry").last_status == "ok"

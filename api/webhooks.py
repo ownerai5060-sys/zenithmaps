@@ -1,12 +1,14 @@
-"""Catalog-change webhooks with durable delivery log + HMAC stub (N3+).
+"""Catalog-change webhooks with durable registry, delivery log + HMAC + retries.
 
 Operators register callback URLs. The API fires a best-effort HTTP POST when:
 
 * an admin API key is created, or
 * the catalog version is bumped via the admin endpoint.
 
-Deliveries are fire-and-forget for the triggering request, but each attempt is
-recorded in the delivery log (SQLite when ``ZENITH_WEBHOOK_LOG_PATH`` is set).
+Subscriptions and delivery attempts persist in SQLite when
+``ZENITH_WEBHOOK_LOG_PATH`` is set (same file). Failed deliveries are enqueued
+for exponential-backoff retry (``python -m api.webhook_worker``).
+
 When ``ZENITH_WEBHOOK_SIGNING_SECRET`` is set, requests include::
 
     X-Zenith-Signature: sha256=<hex hmac of raw JSON body>
@@ -32,6 +34,8 @@ import httpx
 
 from api.config import get_settings
 from api.webhook_log import get_delivery_log
+from api.webhook_retry import get_retry_queue
+from api.webhook_store import connect, ensure_schema
 
 logger = logging.getLogger("zenith.webhooks")
 
@@ -64,15 +68,95 @@ _ALLOWED_EVENTS = frozenset({"catalog.updated", "admin.key_created", "webhook.pi
 
 
 class WebhookRegistry:
-    """Thread-safe in-memory webhook subscription store."""
+    """Thread-safe webhook subscription store with optional SQLite durability."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._items: dict[str, WebhookSubscription] = {}
+        self._path: str = ""
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    @property
+    def durable(self) -> bool:
+        return bool(self._path)
+
+    def configure(self, path: str | None) -> None:
+        """Point at a SQLite path and load subscriptions (empty = memory only)."""
+        with self._lock:
+            self._path = (path or "").strip()
+            self._items.clear()
+            if self._path:
+                with connect(self._path) as conn:
+                    ensure_schema(conn)
+                    rows = conn.execute(
+                        "SELECT * FROM webhook_subscriptions"
+                    ).fetchall()
+                for row in rows:
+                    events = frozenset(
+                        e for e in str(row["events"]).split(",") if e
+                    )
+                    self._items[row["id"]] = WebhookSubscription(
+                        id=row["id"],
+                        url=row["url"],
+                        events=events,
+                        label=row["label"] or "",
+                        created_at=float(row["created_at"]),
+                        last_ping_at=(
+                            float(row["last_ping_at"])
+                            if row["last_ping_at"] is not None
+                            else None
+                        ),
+                        last_status=row["last_status"],
+                        last_error=row["last_error"],
+                        active=bool(row["active"]),
+                    )
 
     def reset(self) -> None:
         with self._lock:
             self._items.clear()
+            if self._path:
+                with connect(self._path) as conn:
+                    ensure_schema(conn)
+                    conn.execute("DELETE FROM webhook_subscriptions")
+                    conn.commit()
+
+    def _persist_unlocked(self, sub: WebhookSubscription) -> None:
+        if not self._path:
+            return
+        with connect(self._path) as conn:
+            ensure_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO webhook_subscriptions
+                    (id, url, events, label, created_at, last_ping_at,
+                     last_status, last_error, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    url=excluded.url,
+                    events=excluded.events,
+                    label=excluded.label,
+                    created_at=excluded.created_at,
+                    last_ping_at=excluded.last_ping_at,
+                    last_status=excluded.last_status,
+                    last_error=excluded.last_error,
+                    active=excluded.active
+                """,
+                (
+                    sub.id,
+                    sub.url,
+                    ",".join(sorted(sub.events)),
+                    sub.label,
+                    sub.created_at,
+                    sub.last_ping_at,
+                    sub.last_status,
+                    sub.last_error,
+                    1 if sub.active else 0,
+                ),
+            )
+            conn.commit()
 
     def list(self, *, include_inactive: bool = False) -> list[WebhookSubscription]:
         with self._lock:
@@ -110,6 +194,7 @@ class WebhookRegistry:
                 created_at=time.time(),
             )
             self._items[wid] = sub
+            self._persist_unlocked(sub)
             return sub
 
     def delete(self, webhook_id: str) -> WebhookSubscription | None:
@@ -118,6 +203,7 @@ class WebhookRegistry:
             if sub is None:
                 return None
             sub.active = False
+            self._persist_unlocked(sub)
             return sub
 
     def record_ping(
@@ -134,6 +220,7 @@ class WebhookRegistry:
             sub.last_ping_at = time.time()
             sub.last_status = status
             sub.last_error = error
+            self._persist_unlocked(sub)
 
 
 _registry = WebhookRegistry()
@@ -185,7 +272,7 @@ def _delivery_headers(event: str, body: bytes) -> dict[str, str]:
     settings = get_settings()
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "zenith-api-webhook/0.5",
+        "User-Agent": "zenith-api-webhook/0.6",
         "X-Zenith-Event": event,
     }
     secret = (settings.webhook_signing_secret or "").strip()
@@ -194,12 +281,31 @@ def _delivery_headers(event: str, body: bytes) -> dict[str, str]:
     return headers
 
 
+def _enqueue_retry(
+    sub: WebhookSubscription,
+    event: str,
+    payload: dict[str, Any],
+    error: str | None,
+) -> None:
+    settings = get_settings()
+    if not getattr(settings, "webhook_retry_enabled", True):
+        return
+    get_retry_queue().enqueue(
+        webhook_id=sub.id,
+        event=event,
+        url=sub.url,
+        payload=payload,
+        error=error,
+    )
+
+
 def _post_one(
     sub: WebhookSubscription,
     event: str,
     payload: dict[str, Any],
     *,
     http: httpx.Client,
+    enqueue_on_failure: bool = True,
 ) -> tuple[bool, str | None, int | None, str | None]:
     """Returns (ok, error, http_status, signature_header)."""
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
@@ -221,6 +327,8 @@ def _post_one(
                 error=msg,
                 signature_header=signature,
             )
+            if enqueue_on_failure:
+                _enqueue_retry(sub, event, payload, msg)
             return False, msg, response.status_code, signature
         get_webhook_registry().record_ping(sub.id, status="ok", error=None)
         get_delivery_log().append(
@@ -245,6 +353,8 @@ def _post_one(
             error=str(exc),
             signature_header=signature,
         )
+        if enqueue_on_failure:
+            _enqueue_retry(sub, event, payload, str(exc))
         return False, str(exc), None, signature
 
 

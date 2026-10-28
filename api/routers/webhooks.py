@@ -46,6 +46,7 @@ class WebhookPublic(BaseModel):
 class WebhookListResponse(BaseModel):
     items: list[WebhookPublic]
     count: int
+    durable: bool = False
 
 
 class WebhookPingResponse(BaseModel):
@@ -97,11 +98,14 @@ def list_webhooks(
     include_inactive: bool = False,
     _principal: Principal = Depends(require_rate_limited("admin:keys")),
 ) -> WebhookListResponse:
+    registry = get_webhook_registry()
     items = [
         _public(w)
-        for w in get_webhook_registry().list(include_inactive=include_inactive)
+        for w in registry.list(include_inactive=include_inactive)
     ]
-    return WebhookListResponse(items=items, count=len(items))
+    return WebhookListResponse(
+        items=items, count=len(items), durable=registry.durable
+    )
 
 
 @router.post(
