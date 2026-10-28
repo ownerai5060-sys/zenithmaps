@@ -20,6 +20,7 @@ from fastapi import Depends, Request, Security
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from api.config import Settings, get_settings
+from api.csrf import require_portal_csrf_if_needed
 from api.errors import ApiError
 from api.keystore import get_keystore
 from api.oauth import get_token_store
@@ -119,6 +120,8 @@ async def require_api_key(
                 message="Invalid or expired portal session cookie",
             )
         request.state.principal = principal
+        # Double-submit CSRF for cookie-authenticated mutations only.
+        require_portal_csrf_if_needed(request, settings)
         return principal
 
     raise ApiError(

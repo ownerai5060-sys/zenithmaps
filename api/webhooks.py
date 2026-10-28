@@ -13,8 +13,8 @@ When ``ZENITH_WEBHOOK_SIGNING_SECRET`` is set, requests include::
 
     X-Zenith-Signature: sha256=<hex hmac of raw JSON body>
 
-Failed pings never fail the triggering request. Soft SSRF guard: only ``https``
-(and ``http`` for localhost in tests).
+Failed pings never fail the triggering request. Soft SSRF guard plus optional
+``ZENITH_WEBHOOK_ALLOWED_HOSTS`` egress allowlist (see ``api.security.webhook_egress``).
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
 from api.config import get_settings
+from api.security.webhook_egress import validate_webhook_egress_url
 from api.webhook_log import get_delivery_log
 from api.webhook_retry import get_retry_queue
 from api.webhook_store import connect, ensure_schema
@@ -231,23 +231,7 @@ def get_webhook_registry() -> WebhookRegistry:
 
 
 def _validate_webhook_url(url: str) -> str:
-    raw = (url or "").strip()
-    if not raw:
-        raise ValueError("url is required")
-    parsed = urlparse(raw)
-    scheme = (parsed.scheme or "").lower()
-    host = (parsed.hostname or "").lower()
-    if scheme not in {"http", "https"}:
-        raise ValueError("webhook URL must be http or https")
-    if not host:
-        raise ValueError("webhook URL missing host")
-    if host.startswith("169.254.") or host in {"metadata.google.internal"}:
-        raise ValueError("webhook host is blocked")
-    if scheme == "http" and host not in {"localhost", "127.0.0.1", "::1"}:
-        settings = get_settings()
-        if getattr(settings, "webhooks_require_https", True):
-            raise ValueError("non-local webhook URLs must use https")
-    return raw
+    return validate_webhook_egress_url(url)
 
 
 def build_event_payload(event: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -308,6 +292,23 @@ def _post_one(
     enqueue_on_failure: bool = True,
 ) -> tuple[bool, str | None, int | None, str | None]:
     """Returns (ok, error, http_status, signature_header)."""
+    # Re-validate at delivery time (defense in depth vs registry drift).
+    try:
+        validate_webhook_egress_url(sub.url)
+    except ValueError as exc:
+        msg = f"egress_blocked: {exc}"
+        get_webhook_registry().record_ping(sub.id, status="error", error=msg)
+        get_delivery_log().append(
+            webhook_id=sub.id,
+            event=event,
+            url=sub.url,
+            status="error",
+            http_status=None,
+            error=msg,
+            signature_header=None,
+        )
+        return False, msg, None, None
+
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
         "utf-8"
     )

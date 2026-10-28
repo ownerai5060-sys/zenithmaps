@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from api.auth import Principal, require_api_key
 from api.config import Settings, get_settings
+from api.csrf import new_csrf_token, portal_cookies_secure
 from api.errors import REQUEST_ID_HEADER, ApiError, get_request_id
 from api.oauth import (
     exchange_stub_authorization_code,
@@ -313,20 +314,41 @@ def _normalize_pkce(
 def _set_portal_cookie(
     response: Response, settings: Settings, access_token: str, *, max_age: int
 ) -> None:
+    """Set HttpOnly session cookie + readable CSRF double-submit cookie.
+
+    Cookie notes (staging/prod):
+    - Session: HttpOnly, SameSite=Lax, Path=/, Secure when public base is https
+      (or ``ZENITH_PORTAL_COOKIE_SECURE=true``). Prefer real IdP sessions in prod.
+    - CSRF: NOT HttpOnly so portal JS can mirror it into ``X-CSRF-Token``.
+    - Not a full shared SSO session store — opaque token (or IdP access token).
+    """
+    secure = portal_cookies_secure(settings)
+    age = max(60, max_age)
     response.set_cookie(
         key=settings.portal_cookie_name,
         value=access_token,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=secure,
         path="/",
-        max_age=max(60, max_age),
+        max_age=age,
     )
+    if settings.portal_csrf_enabled:
+        response.set_cookie(
+            key=settings.portal_csrf_cookie_name,
+            value=new_csrf_token(),
+            httponly=False,
+            samesite="lax",
+            secure=secure,
+            path="/",
+            max_age=age,
+        )
 
 
 def _clear_portal_cookies(response: Response, settings: Settings) -> None:
     response.delete_cookie(settings.portal_cookie_name, path="/")
     response.delete_cookie(settings.portal_pkce_cookie_name, path="/")
+    response.delete_cookie(settings.portal_csrf_cookie_name, path="/")
 
 
 @router.post(
@@ -623,7 +645,7 @@ async def portal_login(
         value=verifier,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=portal_cookies_secure(settings),
         path="/",
         max_age=600,
     )
@@ -787,6 +809,19 @@ async def oidc_config_endpoint(
             "rbac_scopes": {
                 "operator_list": "keys:read",
                 "admin_manage": "admin:keys",
+            },
+            "portal_cookies": {
+                "session": settings.portal_cookie_name,
+                "csrf": settings.portal_csrf_cookie_name,
+                "csrf_header": "X-CSRF-Token",
+                "csrf_enabled": settings.portal_csrf_enabled,
+                "secure": portal_cookies_secure(settings),
+                "samesite": "lax",
+                "notes": (
+                    "Session is HttpOnly; CSRF is double-submit (readable cookie "
+                    "+ X-CSRF-Token). Secure follows ZENITH_PORTAL_COOKIE_SECURE "
+                    "or https public base URL."
+                ),
             },
             "mode": (
                 "idp"

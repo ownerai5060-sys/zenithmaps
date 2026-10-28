@@ -143,6 +143,7 @@ def create_app() -> FastAPI:
             "Content-Type",
             "X-API-Key",
             "X-Request-ID",
+            "X-CSRF-Token",
         ],
         expose_headers=[
             REQUEST_ID_HEADER,
@@ -233,6 +234,8 @@ def create_app() -> FastAPI:
                     ],
                     "pkce": "S256",
                     "portal_cookie": settings.portal_cookie_name,
+                    "portal_csrf_cookie": settings.portal_csrf_cookie_name,
+                    "portal_csrf_header": "X-CSRF-Token",
                     "rbac": {
                         "operator_list": "keys:read",
                         "admin_manage": "admin:keys",
@@ -241,10 +244,16 @@ def create_app() -> FastAPI:
                     "oidc_auth_code": bool(settings.oidc_token_url),
                 },
                 "features_mode": "wfs_lite",
+                "tile_cdn": {
+                    "zenith_hosts_tiles": False,
+                    "allowlisted_base_urls": list(settings.tile_cdn_base_urls),
+                },
+                "webhook_egress_allowlist": sorted(settings.webhook_allowed_hosts),
                 "key_vault_durable": bool(settings.key_vault_path),
                 "webhook_log_durable": bool(settings.webhook_log_path),
                 "webhook_registry_durable": bool(settings.webhook_log_path),
                 "webhook_retry_enabled": bool(settings.webhook_retry_enabled),
+                "readiness": "staging-ready",
                 "request_id": get_request_id(request),
             },
             headers={REQUEST_ID_HEADER: get_request_id(request)},

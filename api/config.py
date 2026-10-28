@@ -53,6 +53,12 @@ class Settings:
     )
     # When True, non-local webhook callback URLs must use https (N3).
     webhooks_require_https: bool = True
+    # Optional egress host allowlist for webhook callbacks. Empty = any public
+    # https host (still blocks private/metadata). Production should set this.
+    webhook_allowed_hosts: FrozenSet[str] = frozenset()
+    # Optional CDN base URL allowlist (policy stub — Zenith does not host CDN).
+    # Comma-separated absolute https bases, e.g. https://tiles.example.com
+    tile_cdn_base_urls: tuple[str, ...] = ()
     # Optional layer-name allowlist per host. Empty set = any layer on that host.
     wms_allowed_layers: FrozenSet[str] = frozenset(
         {
@@ -105,6 +111,12 @@ class Settings:
     # HttpOnly cookie used by the static key portal after OIDC / stub login.
     portal_cookie_name: str = "zenith_portal_token"
     portal_pkce_cookie_name: str = "zenith_pkce_verifier"
+    # Non-HttpOnly double-submit CSRF cookie (readable by portal JS).
+    portal_csrf_cookie_name: str = "zenith_portal_csrf"
+    # auto | true | false — Secure flag for portal session/CSRF/PKCE cookies.
+    portal_cookie_secure: str = "auto"
+    # Enforce CSRF double-submit for portal-cookie mutating requests.
+    portal_csrf_enabled: bool = True
     # Webhook durability + HMAC signing stub.
     # Same SQLite path holds subscriptions, delivery log, and retry queue.
     webhook_log_path: str = ""
@@ -250,6 +262,13 @@ def get_settings() -> Settings:
             "ZENITH_OTEL_EXPORTER_OTLP_ENDPOINT", ""
         ).strip(),
         webhooks_require_https=_bool("ZENITH_WEBHOOKS_REQUIRE_HTTPS", True),
+        webhook_allowed_hosts=frozenset(
+            h.lower()
+            for h in _parse_csv(os.getenv("ZENITH_WEBHOOK_ALLOWED_HOSTS"), ())
+        ),
+        tile_cdn_base_urls=_parse_csv(
+            os.getenv("ZENITH_TILE_CDN_BASE_URLS"), ()
+        ),
         key_vault_path=os.getenv("ZENITH_KEY_VAULT_PATH", "").strip(),
         database_url=os.getenv("ZENITH_DATABASE_URL", "").strip(),
         features_table=(
@@ -289,6 +308,17 @@ def get_settings() -> Settings:
             ).strip()
             or "zenith_pkce_verifier"
         ),
+        portal_csrf_cookie_name=(
+            os.getenv(
+                "ZENITH_PORTAL_CSRF_COOKIE_NAME", "zenith_portal_csrf"
+            ).strip()
+            or "zenith_portal_csrf"
+        ),
+        portal_cookie_secure=(
+            os.getenv("ZENITH_PORTAL_COOKIE_SECURE", "auto").strip().lower()
+            or "auto"
+        ),
+        portal_csrf_enabled=_bool("ZENITH_PORTAL_CSRF_ENABLED", True),
         webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
         webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
         webhook_retry_enabled=_bool("ZENITH_WEBHOOK_RETRY_ENABLED", True),
