@@ -734,7 +734,8 @@ def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
     assert "admin_webhook_deliveries" in body["endpoints"]
     assert body["webhook_registry_durable"] is True
     assert body["webhook_retry_enabled"] is True
-    assert body["package_version"] == "0.12.0"
+    assert body["package_version"] == "0.12.1"
+    assert body["readiness"] == "staging-ready"
 
 
 def test_webhook_registry_survives_reconfigure(
@@ -1582,4 +1583,19 @@ def test_portal_token_exchange(client: TestClient) -> None:
 def test_package_version_012(client: TestClient) -> None:
     root = client.get("/api/v1")
     assert root.status_code == 200
-    assert root.json()["package_version"] == "0.12.0"
+    assert root.json()["package_version"] == "0.12.1"
+
+
+def test_compose_smoke_contract(client: TestClient, auth_headers: dict[str, str]) -> None:
+    """Mirrors scripts/compose_smoke.sh against in-process ASGI (no live server)."""
+    health = client.get("/healthz")
+    assert health.status_code == 200
+    assert health.json()["status"] in {"ok", "degraded"}
+
+    meta = client.get("/api/v1")
+    assert meta.status_code == 200
+    assert meta.json()["readiness"] == "staging-ready"
+
+    layers = client.get("/api/v1/layers", headers=auth_headers)
+    assert layers.status_code == 200
+    assert layers.json()["count"] >= 1

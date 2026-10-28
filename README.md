@@ -19,11 +19,12 @@ for external applications.
 (عمداً به تعویق افتاده). کاشی‌ها فقط URLهای allowlist‌شدهٔ کاتالوگ هستند؛
 سیاست CDN: `docs/tile-cdn-policy.md` و env اختیاری `ZENITH_TILE_CDN_BASE_URLS`.
 
-**وضعیت آمادگی API:** `staging-ready` (package `0.12.0` — sandbox / پروتوتایپ خارجی).
-چرخش کلید مبتنی بر سیاست، پل SSO استریم‌لیت، Redis/OTel extras، نمونهٔ
-`docker compose` (API+Redis+PostGIS+OTel)، و یادداشت sidecar خروجی webhook.
-موارد فقط‑پروداکشن باقی‌مانده: IdP واقعی، SLA، CDN عملیاتی، queue مدیریت‌شده،
-egress سازمانی.
+**وضعیت نرم‌افزار / آمادگی:** **software-complete** + **`staging-ready`**
+(package `0.12.1` — sandbox / پروتوتایپ خارجی). کار داخل مخزن بسته است؛
+برچسب عملیاتی هنوز staging است (بدون SLA پروداکشن).
+پس از `docker compose up`، دود دستی: `./scripts/compose_smoke.sh`
+(`docs/compose-smoke.md`). باقی‌مانده فقط زیرساخت خارجی: IdP واقعی،
+Redis/PostGIS/OTel مدیریت‌شده، CDN، queue، egress سازمانی، SLA/on-call.
 
 ---
 
@@ -62,6 +63,7 @@ uvicorn api.main:app --reload --port 8000
 - Streamlit SSO bridge: shared `ZENITH_PORTAL_COOKIE_DOMAIN` + `/oauth/portal/token-exchange` (see `zenith_client/sso_bridge.py`)
 - Optional Redis/OTel: `pip install -r requirements-api-extras.txt`; sample `docs/otel-collector.env.sample`
 - Local stack sample: `docker compose --env-file compose.env.sample up --build` (API + Redis + PostGIS + OTel collector)
+- Compose smoke: `./scripts/compose_smoke.sh` — `GET /healthz`, `GET /api/v1`, `GET /api/v1/layers` with demo key (`docs/compose-smoke.md`)
 - Webhook egress: soft SSRF + `ZENITH_WEBHOOK_ALLOWED_HOSTS`; optional allowlist sidecar `docs/webhook-egress-proxy.md` (`--profile egress`)
 - Tile CDN policy stub: `ZENITH_TILE_CDN_BASE_URLS` (allowlist only; no hosted CDN)
 - OAuth/OIDC: `/oauth/token` supports `client_credentials`, `authorization_code`, `refresh_token`

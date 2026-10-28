@@ -1,11 +1,14 @@
 # Local / staging sample stack: API + Redis + PostGIS + OTel collector.
 # Not a production SLA deployment — demo credentials and debug exporter only.
+# In-repo software is complete; readiness label remains staging-ready.
 #
 #   docker compose --env-file compose.env.sample up --build
-#   curl -s http://127.0.0.1:8000/healthz
+#   ./scripts/compose_smoke.sh          # healthz + /api/v1 + layers (demo key)
+#   # or: curl -s http://127.0.0.1:8000/healthz
 #
 # Optional webhook egress allowlist sidecar:
 #   docker compose --env-file compose.env.sample --profile egress up --build
+# Docs: docs/compose-smoke.md
 
 name: zenithmaps
 
