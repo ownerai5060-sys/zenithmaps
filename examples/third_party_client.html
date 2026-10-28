@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Zenith API — sample third-party client</title>
+    <style>
+      :root {
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: #1a2332;
+        background: linear-gradient(160deg, #e8eef5 0%, #f7f3ea 100%);
+      }
+      body {
+        max-width: 52rem;
+        margin: 2rem auto;
+        padding: 0 1.25rem 3rem;
+      }
+      h1 {
+        font-family: "IBM Plex Serif", Georgia, serif;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+      label {
+        display: block;
+        margin-top: 0.75rem;
+        font-size: 0.85rem;
+      }
+      input {
+        width: 100%;
+        padding: 0.5rem 0.65rem;
+        border: 1px solid #9aa8bc;
+        border-radius: 4px;
+        background: #fff;
+        box-sizing: border-box;
+      }
+      button {
+        margin-top: 1rem;
+        padding: 0.55rem 1.1rem;
+        border: 0;
+        background: #1f4b7a;
+        color: #fff;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #16385c;
+      }
+      pre {
+        margin-top: 1.25rem;
+        padding: 1rem;
+        background: #101820;
+        color: #d7e6f5;
+        overflow: auto;
+        border-radius: 4px;
+        min-height: 8rem;
+        white-space: pre-wrap;
+      }
+      .hint {
+        color: #4a5a6e;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Zenith Maps — third-party sample</h1>
+    <p class="hint">
+      Calls <code>/api/v1/layers</code> and legend with an API key. Serve the API
+      with CORS allowing this page origin (default includes
+      <code>http://localhost:3000</code>). Demo key is for local use only.
+    </p>
+    <label for="base">API base URL</label>
+    <input id="base" value="http://127.0.0.1:8000" />
+    <label for="key">X-API-Key</label>
+    <input id="key" value="zenith_demo_key_layers_read" />
+    <button type="button" id="run">Fetch catalog + legend</button>
+    <pre id="out">Ready.</pre>
+    <script>
+      const out = document.getElementById("out");
+      document.getElementById("run").addEventListener("click", async () => {
+        const base = document.getElementById("base").value.replace(/\/$/, "");
+        const key = document.getElementById("key").value;
+        out.textContent = "Loading…";
+        try {
+          const headers = { "X-API-Key": key };
+          const layersRes = await fetch(base + "/api/v1/layers", { headers });
+          const layersBody = await layersRes.json();
+          if (!layersRes.ok) throw new Error(JSON.stringify(layersBody));
+          const legendRes = await fetch(
+            base + "/api/v1/layers/esa-worldcover-2020/legend",
+            { headers }
+          );
+          const legendBody = await legendRes.json();
+          if (!legendRes.ok) throw new Error(JSON.stringify(legendBody));
+          const checkRes = await fetch(base + "/api/v1/security/check-url", {
+            method: "POST",
+            headers: { ...headers, "Content-Type": "application/json" },
+            body: JSON.stringify({ url: "https://evil.example/wms" }),
+          });
+          const checkBody = await checkRes.json();
+          out.textContent = JSON.stringify(
+            {
+              layers: layersBody,
+              legend_entries: legendBody.entries.length,
+              first_legend: legendBody.entries[0],
+              evil_url_allowed: checkBody.allowed,
+            },
+            null,
+            2
+          );
+        } catch (err) {
+          out.textContent = "Error: " + err;
+        }
+      });
+    </script>
+  </body>
+</html>
