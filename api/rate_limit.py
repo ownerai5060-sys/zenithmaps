@@ -243,6 +243,27 @@ def require_rate_limited(
     return _checker
 
 
+def require_rate_limited_any(
+    *accepted: str,
+) -> Callable[..., Principal]:
+    """Auth + at-least-one scope + rate-limit (portal operator vs admin)."""
+
+    from api.auth import require_any_scope
+
+    scope_dep = require_any_scope(*accepted) if accepted else require_api_key
+
+    async def _checker(
+        request: Request,
+        principal: Principal = Depends(scope_dep),
+        settings: Settings = Depends(get_settings),
+    ) -> Principal:
+        headers = apply_rate_limit(principal, settings=settings)
+        request.state.rate_limit_headers = headers
+        return principal
+
+    return _checker
+
+
 class RateLimitHeaderMiddleware(BaseHTTPMiddleware):
     """Attach rate-limit headers from ``request.state`` onto responses."""
 

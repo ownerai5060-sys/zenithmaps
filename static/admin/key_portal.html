@@ -81,6 +81,7 @@
       flex-wrap: wrap;
       gap: 0.5rem;
       margin-top: 0.25rem;
+      align-items: center;
     }
     button {
       border: 0;
@@ -137,16 +138,30 @@
     .secret-once.show { display: block; }
     .hint { color: var(--muted); font-size: 0.82rem; margin: 0.35rem 0 0; }
     a { color: var(--accent); }
+    .badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      margin-left: 0.35rem;
+    }
+    .badge.admin { border-color: color-mix(in srgb, var(--accent) 50%, transparent); color: var(--accent); }
+    .badge.operator { border-color: color-mix(in srgb, var(--ok) 50%, transparent); color: var(--ok); }
+    .hidden { display: none !important; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 0.35rem; }
   </style>
 </head>
 <body>
   <main>
     <h1>Zenith API Key Portal</h1>
     <p class="lede">
-      Minimal operator UI for create / list / revoke against
-      <code>/api/v1/admin/keys</code>. Requires an admin key with scope
-      <code>admin:keys</code>. Secrets are shown <strong>once</strong> on create.
-      Prefer the durable vault (<code>ZENITH_KEY_VAULT_PATH</code>) in staging.
+      Operator / admin UI for list / create / revoke / rotate against
+      <code>/api/v1/admin/keys</code>. Prefer
+      <strong>Sign in (OIDC / stub)</strong> — PKCE S256 sets an HttpOnly session
+      cookie so you do not paste an admin key. Scopes:
+      <code>keys:read</code> (list) vs <code>admin:keys</code> (mutate).
     </p>
 
     <section class="panel">
@@ -155,22 +170,30 @@
           <label for="baseUrl">API base URL</label>
           <input id="baseUrl" value="" autocomplete="off" />
         </div>
-        <div>
-          <label for="adminKey">Admin API key</label>
-          <input id="adminKey" type="password" value="zenith_admin_key_manage" autocomplete="off" />
+        <div id="adminKeyWrap">
+          <label for="adminKey">Admin / operator API key (fallback)</label>
+          <input id="adminKey" type="password" value="" autocomplete="off" placeholder="optional if signed in" />
         </div>
       </div>
-      <p class="hint">Demo admin secret is for local/sandbox only. Override in real deploys.</p>
+      <p class="hint">
+        Demo: admin <code>zenith_admin_key_manage</code> (<code>admin:keys</code>),
+        operator <code>zenith_operator_key_read</code> (<code>keys:read</code> only).
+        Local stub SSO: Sign in as admin / operator below.
+      </p>
       <div class="actions">
-        <button type="button" id="btnConnect" class="secondary">Check connection</button>
+        <button type="button" id="btnLoginAdmin">Sign in as admin (stub/OIDC)</button>
+        <button type="button" id="btnLoginOperator" class="secondary">Sign in as operator</button>
+        <button type="button" id="btnLogout" class="secondary">Sign out</button>
+        <button type="button" id="btnConnect" class="secondary">Check session</button>
         <button type="button" id="btnRefresh">Refresh list</button>
         <a href="/docs" target="_blank" rel="noopener">OpenAPI docs</a>
+        <span id="roleBadge" class="badge hidden"></span>
       </div>
       <div id="status" class="msg" role="status"></div>
     </section>
 
-    <section class="panel">
-      <h2 style="margin:0 0 0.75rem;font-size:1.05rem;">Create key</h2>
+    <section class="panel" id="createPanel">
+      <h2 style="margin:0 0 0.75rem;font-size:1.05rem;">Create key <span class="hint">(admin:keys)</span></h2>
       <div class="row">
         <div>
           <label for="keyId">key_id (optional)</label>
@@ -210,7 +233,7 @@
             </tr>
           </thead>
           <tbody id="keyRows">
-            <tr><td colspan="5" class="hint">Connect and refresh to load keys.</td></tr>
+            <tr><td colspan="5" class="hint">Sign in or paste a key, then refresh.</td></tr>
           </tbody>
         </table>
       </div>
@@ -219,10 +242,10 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
+    let session = null; // { can_manage_keys, can_list_keys, ... }
 
     function defaultBase() {
-      // Same origin when served from the API; otherwise localhost default.
-      if (location.port === "8000" || location.pathname.startsWith("/static/")) {
+      if (location.port === "8000" || location.pathname.startsWith("/static/") || location.pathname.startsWith("/admin/")) {
         return location.origin;
       }
       return "http://127.0.0.1:8000";
@@ -236,11 +259,13 @@
     }
 
     function headers() {
-      return {
+      const h = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-API-Key": $("adminKey").value.trim(),
       };
+      const key = $("adminKey").value.trim();
+      if (key) h["X-API-Key"] = key;
+      return h;
     }
 
     async function api(method, path, body) {
@@ -248,6 +273,7 @@
       const res = await fetch(base + path, {
         method,
         headers: headers(),
+        credentials: "include",
         body: body ? JSON.stringify(body) : undefined,
       });
       let data = null;
@@ -266,6 +292,44 @@
       return data;
     }
 
+    function applyRoleUi() {
+      const badge = $("roleBadge");
+      const createPanel = $("createPanel");
+      if (!session) {
+        badge.className = "badge hidden";
+        createPanel.classList.remove("hidden");
+        return;
+      }
+      badge.classList.remove("hidden");
+      if (session.can_manage_keys) {
+        badge.textContent = "admin";
+        badge.className = "badge admin";
+        createPanel.classList.remove("hidden");
+      } else {
+        badge.textContent = "operator (read-only)";
+        badge.className = "badge operator";
+        createPanel.classList.add("hidden");
+      }
+    }
+
+    async function refreshSession() {
+      try {
+        session = await api("GET", "/oauth/portal/session");
+        showMsg(
+          $("status"),
+          "Signed in as " + session.key_id + " via " + session.auth_via +
+            " — scopes: " + (session.scopes || []).join(", "),
+          true
+        );
+        applyRoleUi();
+        return true;
+      } catch (e) {
+        session = null;
+        applyRoleUi();
+        return false;
+      }
+    }
+
     async function refreshList() {
       const include = $("includeRevoked").checked ? "true" : "false";
       const data = await api("GET", "/api/v1/admin/keys?include_revoked=" + include);
@@ -275,6 +339,7 @@
         tbody.innerHTML = '<tr><td colspan="5" class="hint">No keys returned.</td></tr>';
         return;
       }
+      const canManage = session && session.can_manage_keys;
       for (const item of data.items) {
         const tr = document.createElement("tr");
         const scopes = (item.scopes || []).join(", ");
@@ -284,14 +349,21 @@
           <td class="mono">${escapeHtml(scopes)}</td>
           <td>${escapeHtml(item.label || "")}</td>
           <td>${status}</td>
-          <td></td>`;
-        if (!item.revoked) {
-          const btn = document.createElement("button");
-          btn.type = "button";
-          btn.className = "danger";
-          btn.textContent = "Revoke";
-          btn.addEventListener("click", () => revokeKey(item.key_id));
-          tr.lastElementChild.appendChild(btn);
+          <td><div class="btn-row"></div></td>`;
+        const row = tr.querySelector(".btn-row");
+        if (!item.revoked && canManage) {
+          const rotateBtn = document.createElement("button");
+          rotateBtn.type = "button";
+          rotateBtn.className = "secondary";
+          rotateBtn.textContent = "Rotate";
+          rotateBtn.addEventListener("click", () => rotateKey(item.key_id));
+          row.appendChild(rotateBtn);
+          const revokeBtn = document.createElement("button");
+          revokeBtn.type = "button";
+          revokeBtn.className = "danger";
+          revokeBtn.textContent = "Revoke";
+          revokeBtn.addEventListener("click", () => revokeKey(item.key_id));
+          row.appendChild(revokeBtn);
         }
         tbody.appendChild(tr);
       }
@@ -317,12 +389,62 @@
       }
     }
 
+    async function rotateKey(keyId) {
+      if (!confirm("Rotate secret for '" + keyId + "'? Old secret stops working immediately.")) return;
+      try {
+        const rotated = await api(
+          "POST",
+          "/api/v1/admin/keys/" + encodeURIComponent(keyId) + "/rotate"
+        );
+        $("secretValue").textContent = rotated.secret;
+        $("createdSecret").classList.add("show");
+        showMsg(
+          $("status"),
+          "Rotated " + keyId + " (tokens cleared: " + (rotated.previous_tokens_revoked || 0) + ")",
+          true
+        );
+        await refreshList();
+      } catch (e) {
+        showMsg($("status"), (e.code ? e.code + ": " : "") + e.message, false);
+      }
+    }
+
+    function startPortalLogin(clientId) {
+      const base = $("baseUrl").value.replace(/\/$/, "");
+      const url = base + "/oauth/portal/login?client_id=" + encodeURIComponent(clientId) +
+        "&return_to=" + encodeURIComponent("/admin/key-portal");
+      window.location.href = url;
+    }
+
+    $("btnLoginAdmin").addEventListener("click", () => startPortalLogin("admin"));
+    $("btnLoginOperator").addEventListener("click", () => startPortalLogin("operator"));
+
+    $("btnLogout").addEventListener("click", async () => {
+      try {
+        await api("POST", "/oauth/portal/logout");
+        session = null;
+        applyRoleUi();
+        showMsg($("status"), "Signed out.", true);
+      } catch (e) {
+        showMsg($("status"), e.message, false);
+      }
+    });
+
     $("btnConnect").addEventListener("click", async () => {
       try {
         const h = await fetch($("baseUrl").value.replace(/\/$/, "") + "/healthz?check_upstreams=false");
         const body = await h.json();
-        showMsg($("status"), "API " + (body.status || "ok") + " — package " + (body.package_version || "?"), true);
-        await refreshList();
+        const ok = await refreshSession();
+        if (!ok) {
+          showMsg(
+            $("status"),
+            "API " + (body.status || "ok") + " — no portal session; paste a key or Sign in.",
+            true
+          );
+        }
+        if (ok || $("adminKey").value.trim()) {
+          await refreshList();
+        }
       } catch (e) {
         showMsg($("status"), "Cannot reach API: " + e.message, false);
       }
@@ -358,6 +480,14 @@
         showMsg($("status"), (e.code ? e.code + ": " : "") + e.message, false);
       }
     });
+
+    // Auto-detect session after SSO redirect.
+    (async () => {
+      const ok = await refreshSession();
+      if (ok) {
+        try { await refreshList(); } catch (_) { /* ignore until scopes ok */ }
+      }
+    })();
   </script>
 </body>
 </html>

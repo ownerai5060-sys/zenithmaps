@@ -238,6 +238,25 @@ class KeyStore:
             self._persist_unlocked(updated)
             return updated
 
+    def rotate(
+        self, key_id: str, *, secret: str | None = None
+    ) -> StoredKey | None:
+        """Replace the secret for an active key (same id / scopes / label).
+
+        Returns the updated ``StoredKey`` with the **new** secret, or ``None``
+        when the key is missing / already revoked.
+        """
+        self.ensure_seeded()
+        new_secret = secret or f"zenith_{secrets.token_urlsafe(24)}"
+        with self._lock:
+            stored = self._keys.get(key_id)
+            if stored is None or stored.revoked:
+                return None
+            updated = replace(stored, secret=new_secret)
+            self._keys[key_id] = updated
+            self._persist_unlocked(updated)
+            return updated
+
 
 _KEYSTORE = KeyStore()
 

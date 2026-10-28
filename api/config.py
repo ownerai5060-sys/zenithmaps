@@ -99,6 +99,12 @@ class Settings:
     oidc_redirect_uri: str = "http://127.0.0.1:8000/oauth/callback"
     oidc_scopes: str = "openid layers:read"
     oauth_refresh_ttl_s: int = 86400
+    # When True, /oauth/authorize requires PKCE S256 (code_challenge).
+    # When False, PKCE is still enforced whenever a challenge was supplied.
+    oidc_pkce_required: bool = False
+    # HttpOnly cookie used by the static key portal after OIDC / stub login.
+    portal_cookie_name: str = "zenith_portal_token"
+    portal_pkce_cookie_name: str = "zenith_pkce_verifier"
     # Webhook durability + HMAC signing stub.
     # Same SQLite path holds subscriptions, delivery log, and retry queue.
     webhook_log_path: str = ""
@@ -136,9 +142,15 @@ def _default_demo_keys() -> tuple[ApiKeyRecord, ...]:
             label="Read-only integration key",
         ),
         ApiKeyRecord(
+            key_id="operator",
+            secret="zenith_operator_key_read",
+            scopes=frozenset({"layers:read", "keys:read"}),
+            label="Portal operator (list keys only; local/sandbox)",
+        ),
+        ApiKeyRecord(
             key_id="admin",
             secret="zenith_admin_key_manage",
-            scopes=frozenset({"layers:read", "admin:keys"}),
+            scopes=frozenset({"layers:read", "keys:read", "admin:keys"}),
             label="Admin key management (local/sandbox only)",
         ),
     )
@@ -266,6 +278,17 @@ def get_settings() -> Settings:
             or "openid layers:read"
         ),
         oauth_refresh_ttl_s=_int("ZENITH_OAUTH_REFRESH_TTL_S", 86400),
+        oidc_pkce_required=_bool("ZENITH_OIDC_PKCE_REQUIRED", False),
+        portal_cookie_name=(
+            os.getenv("ZENITH_PORTAL_COOKIE_NAME", "zenith_portal_token").strip()
+            or "zenith_portal_token"
+        ),
+        portal_pkce_cookie_name=(
+            os.getenv(
+                "ZENITH_PORTAL_PKCE_COOKIE_NAME", "zenith_pkce_verifier"
+            ).strip()
+            or "zenith_pkce_verifier"
+        ),
         webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
         webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
         webhook_retry_enabled=_bool("ZENITH_WEBHOOK_RETRY_ENABLED", True),

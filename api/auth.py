@@ -40,13 +40,42 @@ class Principal:
     auth_via: str = "api_key"  # "api_key" | "bearer" | "oidc_jwt"
 
 
+def _principal_from_bearer_token(
+    token: str, settings: Settings, *, auth_via: str
+) -> Principal | None:
+    """Resolve opaque / JWT bearer into a Principal, or None if invalid."""
+    if settings.oidc_jwks_url and looks_like_jwt(token):
+        jwt_principal = validate_bearer_jwt(token, settings)
+        if jwt_principal is None:
+            return None
+        return Principal(
+            key_id=f"oidc:{jwt_principal.subject}",
+            scopes=jwt_principal.scopes,
+            label=jwt_principal.label,
+            auth_via="oidc_jwt" if auth_via == "bearer" else auth_via,
+        )
+
+    access = get_token_store().lookup(token)
+    if access is None:
+        return None
+    stored = get_keystore().get(access.key_id)
+    if stored is None or stored.revoked:
+        return None
+    return Principal(
+        key_id=access.key_id,
+        scopes=access.scopes,
+        label=access.label,
+        auth_via=auth_via,
+    )
+
+
 async def require_api_key(
     request: Request,
     api_key: str | None = Security(api_key_header),
     bearer: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
     settings: Settings = Depends(get_settings),
 ) -> Principal:
-    # Prefer explicit API key header; fall back to Bearer (JWT or opaque).
+    # Prefer explicit API key header; then Authorization Bearer; then portal cookie.
     if api_key:
         stored = get_keystore().lookup_by_secret(api_key)
         if stored is None:
@@ -65,54 +94,40 @@ async def require_api_key(
         return principal
 
     if bearer is not None and bearer.scheme.lower() == "bearer" and bearer.credentials:
-        token = bearer.credentials
-
-        # OIDC JWT path (optional): try when JWKS configured and token looks like JWT.
-        if settings.oidc_jwks_url and looks_like_jwt(token):
-            jwt_principal = validate_bearer_jwt(token, settings)
-            if jwt_principal is None:
-                raise ApiError(
-                    status_code=401,
-                    code="unauthorized",
-                    message="Invalid or expired JWT",
-                )
-            principal = Principal(
-                key_id=f"oidc:{jwt_principal.subject}",
-                scopes=jwt_principal.scopes,
-                label=jwt_principal.label,
-                auth_via="oidc_jwt",
-            )
-            request.state.principal = principal
-            return principal
-
-        access = get_token_store().lookup(token)
-        if access is None:
+        principal = _principal_from_bearer_token(
+            bearer.credentials, settings, auth_via="bearer"
+        )
+        if principal is None:
             raise ApiError(
                 status_code=401,
                 code="unauthorized",
                 message="Invalid or expired bearer token",
             )
-        # Confirm the underlying key is still active (revocation).
-        stored = get_keystore().get(access.key_id)
-        if stored is None or stored.revoked:
+        request.state.principal = principal
+        return principal
+
+    cookie_name = settings.portal_cookie_name or "zenith_portal_token"
+    cookie_token = (request.cookies.get(cookie_name) or "").strip()
+    if cookie_token:
+        principal = _principal_from_bearer_token(
+            cookie_token, settings, auth_via="portal_cookie"
+        )
+        if principal is None:
             raise ApiError(
                 status_code=401,
                 code="unauthorized",
-                message="Token revoked",
+                message="Invalid or expired portal session cookie",
             )
-        principal = Principal(
-            key_id=access.key_id,
-            scopes=access.scopes,
-            label=access.label,
-            auth_via="bearer",
-        )
         request.state.principal = principal
         return principal
 
     raise ApiError(
         status_code=401,
         code="unauthorized",
-        message=f"Missing {API_KEY_HEADER_NAME} header or Bearer token",
+        message=(
+            f"Missing {API_KEY_HEADER_NAME} header, Bearer token, "
+            "or portal session cookie"
+        ),
     )
 
 
@@ -126,6 +141,25 @@ def require_scopes(*needed: str) -> Callable[..., Principal]:
                 status_code=403,
                 code="forbidden",
                 message=f"Missing required scope(s): {', '.join(missing)}",
+            )
+        return principal
+
+    return _checker
+
+
+def require_any_scope(*accepted: str) -> Callable[..., Principal]:
+    """Dependency factory: principal must hold at least one of ``accepted``."""
+
+    async def _checker(principal: Principal = Depends(require_api_key)) -> Principal:
+        if not any(scope in principal.scopes for scope in accepted):
+            raise ApiError(
+                status_code=403,
+                code="forbidden",
+                message=(
+                    "Missing required scope (need one of: "
+                    + ", ".join(accepted)
+                    + ")"
+                ),
             )
         return principal
 

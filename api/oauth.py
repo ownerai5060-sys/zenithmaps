@@ -63,6 +63,9 @@ class AuthCode:
     redirect_uri: str
     expires_at: float
     used: bool = False
+    # PKCE (RFC 7636): when set, token exchange must supply matching verifier.
+    code_challenge: str = ""
+    code_challenge_method: str = ""
 
     @property
     def expired(self) -> bool:
@@ -154,6 +157,8 @@ class TokenStore:
         redirect_uri: str,
         ttl_s: int = 300,
         scopes: frozenset[str] | None = None,
+        code_challenge: str = "",
+        code_challenge_method: str = "",
     ) -> AuthCode:
         code = secrets.token_urlsafe(24)
         auth = AuthCode(
@@ -163,14 +168,22 @@ class TokenStore:
             label=stored.label,
             redirect_uri=redirect_uri or "",
             expires_at=time.time() + max(60, ttl_s),
+            code_challenge=(code_challenge or "").strip(),
+            code_challenge_method=(code_challenge_method or "").strip(),
         )
         with self._lock:
             self._codes[code] = auth
         return auth
 
     def consume_auth_code(
-        self, code: str, *, redirect_uri: str | None = None
+        self,
+        code: str,
+        *,
+        redirect_uri: str | None = None,
+        code_verifier: str | None = None,
     ) -> AuthCode | None:
+        from api.pkce import verify_s256
+
         with self._lock:
             auth = self._codes.get(code)
             if auth is None or auth.used or auth.expired:
@@ -179,6 +192,14 @@ class TokenStore:
                 return None
             if redirect_uri is not None and auth.redirect_uri:
                 if redirect_uri != auth.redirect_uri:
+                    return None
+            if auth.code_challenge:
+                method = (auth.code_challenge_method or "S256").upper()
+                if method != "S256":
+                    return None
+                if not code_verifier or not verify_s256(
+                    code_verifier, auth.code_challenge
+                ):
                     return None
             # Mark used by replacing with used=True copy then delete.
             del self._codes[code]
@@ -190,6 +211,8 @@ class TokenStore:
                 redirect_uri=auth.redirect_uri,
                 expires_at=auth.expires_at,
                 used=True,
+                code_challenge=auth.code_challenge,
+                code_challenge_method=auth.code_challenge_method,
             )
 
     def consume_refresh(
@@ -258,6 +281,8 @@ def issue_stub_authorization_code(
     *,
     redirect_uri: str = "",
     requested_scope: str | None = None,
+    code_challenge: str = "",
+    code_challenge_method: str = "",
 ) -> AuthCode | None:
     """Local stub: mint a one-time code for an active API key (client_id=key_id)."""
     stored = get_keystore().get(client_id)
@@ -270,7 +295,11 @@ def issue_stub_authorization_code(
             return None
         scopes = frozenset(needed)
     return get_token_store().issue_auth_code(
-        stored, redirect_uri=redirect_uri, scopes=scopes
+        stored,
+        redirect_uri=redirect_uri,
+        scopes=scopes,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
     )
 
 
@@ -278,10 +307,13 @@ def exchange_stub_authorization_code(
     code: str,
     *,
     redirect_uri: str | None = None,
+    code_verifier: str | None = None,
     expires_in_s: int = 3600,
     refresh_expires_in_s: int = 86400,
 ) -> IssuedTokenPair | None:
-    auth = get_token_store().consume_auth_code(code, redirect_uri=redirect_uri)
+    auth = get_token_store().consume_auth_code(
+        code, redirect_uri=redirect_uri, code_verifier=code_verifier
+    )
     if auth is None:
         return None
     stored = get_keystore().get(auth.key_id)

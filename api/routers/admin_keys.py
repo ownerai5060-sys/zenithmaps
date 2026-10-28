@@ -1,8 +1,12 @@
-"""Admin API-key management (create / list / revoke).
+"""Admin / operator API-key management (create / list / revoke / rotate).
 
-Protected by scope ``admin:keys``. Not a full self-service portal — operators
-call these endpoints (or curl) with an admin key. Secrets are returned **only**
-on create; list/revoke never echo the secret.
+Scopes (light portal RBAC):
+- ``keys:read`` — list keys (operator)
+- ``admin:keys`` — create, revoke, rotate (admin)
+
+Secrets are returned **only** on create/rotate; list never echoes the secret.
+Auth may be ``X-API-Key``, Bearer, or the portal session cookie set after
+OIDC / stub login (so the browser need not paste an admin key).
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from api.auth import Principal
 from api.errors import ApiError
 from api.keystore import get_keystore
 from api.oauth import get_token_store
-from api.rate_limit import require_rate_limited
+from api.rate_limit import require_rate_limited, require_rate_limited_any
 
 router = APIRouter(prefix="/admin/keys", tags=["admin"])
 
@@ -46,6 +50,14 @@ class CreateKeyResponse(KeyPublic):
     )
 
 
+class RotateKeyResponse(KeyPublic):
+    secret: str = Field(
+        ...,
+        description="New secret shown once — previous secret is invalidated",
+    )
+    previous_tokens_revoked: int = 0
+
+
 class KeyListResponse(BaseModel):
     items: list[KeyPublic]
     count: int
@@ -58,7 +70,9 @@ class KeyListResponse(BaseModel):
 )
 def list_keys(
     include_revoked: bool = False,
-    _principal: Principal = Depends(require_rate_limited("admin:keys")),
+    _principal: Principal = Depends(
+        require_rate_limited_any("keys:read", "admin:keys")
+    ),
 ) -> KeyListResponse:
     stored = get_keystore().list_keys(include_revoked=include_revoked)
     items = [
@@ -109,6 +123,34 @@ def create_key(
         label=created.label,
         created_at=created.created_at,
         revoked=False,
+    )
+
+
+@router.post(
+    "/{key_id}/rotate",
+    response_model=RotateKeyResponse,
+    summary="Rotate an API key secret (new secret returned once)",
+)
+def rotate_key(
+    key_id: str,
+    _principal: Principal = Depends(require_rate_limited("admin:keys")),
+) -> RotateKeyResponse:
+    rotated = get_keystore().rotate(key_id)
+    if rotated is None:
+        raise ApiError(
+            status_code=404,
+            code="not_found",
+            message=f"API key '{key_id}' was not found or is revoked",
+        )
+    revoked_n = get_token_store().revoke_for_key(key_id)
+    return RotateKeyResponse(
+        key_id=rotated.key_id,
+        secret=rotated.secret,
+        scopes=sorted(rotated.scopes),
+        label=rotated.label,
+        created_at=rotated.created_at,
+        revoked=False,
+        previous_tokens_revoked=revoked_n,
     )
 
 
