@@ -53,6 +53,10 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
         "/metrics",
         "/metrics/prometheus",
         "/oauth/token",
+        "/oauth/authorize",
+        "/oauth/callback",
+        "/oauth/oidc-config",
+        "/admin/key-portal",
         "/api/v1/layers",
         "/api/v1/layers/{layer_id}",
         "/api/v1/layers/{layer_id}/legend",
@@ -346,7 +350,7 @@ def test_oauth_client_credentials_and_bearer(
     bad = client.post(
         "/oauth/token",
         json={
-            "grant_type": "authorization_code",
+            "grant_type": "password",
             "client_id": "demo",
             "client_secret": "zenith_demo_key_layers_read",
         },
@@ -693,9 +697,13 @@ def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
     body = response.json()
     assert body["features_mode"] == "wfs_lite"
     assert body["auth"]["api_key"] == "X-API-Key"
+    assert "authorization_code" in body["auth"]["oauth_grants"]
+    assert body["endpoints"]["oauth_authorize"] == "/oauth/authorize"
+    assert body["key_portal"] == "/admin/key-portal"
     assert "admin_webhook_deliveries" in body["endpoints"]
     assert body["webhook_registry_durable"] is True
     assert body["webhook_retry_enabled"] is True
+    assert body["package_version"] == "0.7.0"
 
 
 def test_webhook_registry_survives_reconfigure(
@@ -826,3 +834,221 @@ def test_webhook_retry_backoff_and_worker(
 
         assert get_retry_queue().list_pending() == []
         assert get_webhook_registry().get("wh-retry").last_status == "ok"
+
+
+def test_key_portal_static_and_redirect(client: TestClient) -> None:
+    """Minimal key portal HTML is served; /admin/key-portal redirects to it."""
+    page = client.get("/static/admin/key_portal.html")
+    assert page.status_code == 200
+    assert "text/html" in page.headers.get("content-type", "")
+    assert "API Key Portal" in page.text
+    assert "/api/v1/admin/keys" in page.text
+
+    redirected = client.get("/admin/key-portal", follow_redirects=False)
+    assert redirected.status_code == 307
+    assert redirected.headers["location"] == "/static/admin/key_portal.html"
+
+
+def test_oauth_auth_code_and_refresh_local_stub(client: TestClient) -> None:
+    """Local stub: authorize → code → token (+ refresh) → refresh grant."""
+    cfg = client.get("/oauth/oidc-config")
+    assert cfg.status_code == 200
+    assert cfg.json()["mode"] == "local_stub"
+    assert "authorization_code" in cfg.json()["grants"]
+
+    auth = client.get(
+        "/oauth/authorize",
+        params={"response_type": "code", "client_id": "demo"},
+    )
+    assert auth.status_code == 200
+    code = auth.json()["code"]
+    assert code
+
+    token = client.post(
+        "/oauth/token",
+        json={"grant_type": "authorization_code", "code": code},
+    )
+    assert token.status_code == 200
+    body = token.json()
+    assert body["access_token"]
+    assert body["refresh_token"]
+    assert "layers:read" in body["scope"]
+
+    layers = client.get(
+        "/api/v1/layers",
+        headers={"Authorization": f"Bearer {body['access_token']}"},
+    )
+    assert layers.status_code == 200
+
+    # Code is one-time.
+    reuse = client.post(
+        "/oauth/token",
+        json={"grant_type": "authorization_code", "code": code},
+    )
+    assert reuse.status_code == 400
+    assert reuse.json()["code"] == "invalid_grant"
+
+    refreshed = client.post(
+        "/oauth/token",
+        json={
+            "grant_type": "refresh_token",
+            "refresh_token": body["refresh_token"],
+        },
+    )
+    assert refreshed.status_code == 200
+    new_body = refreshed.json()
+    assert new_body["access_token"]
+    assert new_body["refresh_token"]
+    assert new_body["access_token"] != body["access_token"]
+
+    # Old refresh token is consumed.
+    again = client.post(
+        "/oauth/token",
+        json={
+            "grant_type": "refresh_token",
+            "refresh_token": body["refresh_token"],
+        },
+    )
+    assert again.status_code == 400
+
+
+def test_oauth_authorize_redirect_to_idp(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZENITH_OIDC_CLIENT_ID", "zenith-app")
+    monkeypatch.setenv(
+        "ZENITH_OIDC_AUTHORIZE_URL", "https://idp.example/authorize"
+    )
+    monkeypatch.setenv(
+        "ZENITH_OIDC_REDIRECT_URI", "http://127.0.0.1:8000/oauth/callback"
+    )
+    get_settings.cache_clear()
+    from api.main import create_app
+
+    with TestClient(create_app()) as oidc_client:
+        resp = oidc_client.get(
+            "/oauth/authorize",
+            params={"response_type": "code", "state": "xyz", "scope": "openid"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        loc = resp.headers["location"]
+        assert loc.startswith("https://idp.example/authorize")
+        assert "client_id=zenith-app" in loc
+        assert "state=xyz" in loc
+        assert "response_type=code" in loc
+    get_settings.cache_clear()
+
+
+def test_oauth_auth_code_proxies_to_idp_token_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ZENITH_OIDC_CLIENT_ID", "zenith-app")
+    monkeypatch.setenv("ZENITH_OIDC_CLIENT_SECRET", "super-secret")
+    monkeypatch.setenv("ZENITH_OIDC_TOKEN_URL", "https://idp.example/token")
+    monkeypatch.setenv(
+        "ZENITH_OIDC_REDIRECT_URI", "http://127.0.0.1:8000/oauth/callback"
+    )
+    get_settings.cache_clear()
+    from api.main import create_app
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "access_token": "idp-access",
+        "token_type": "Bearer",
+        "expires_in": 1800,
+        "refresh_token": "idp-refresh",
+        "scope": "openid layers:read",
+    }
+
+    with patch("api.oidc_flow.httpx.Client") as client_cls:
+        mock_http = MagicMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        client_cls.return_value = mock_http
+
+        with TestClient(create_app()) as oidc_client:
+            token = oidc_client.post(
+                "/oauth/token",
+                json={
+                    "grant_type": "authorization_code",
+                    "code": "from-idp",
+                    "redirect_uri": "http://127.0.0.1:8000/oauth/callback",
+                },
+            )
+            assert token.status_code == 200
+            body = token.json()
+            assert body["access_token"] == "idp-access"
+            assert body["refresh_token"] == "idp-refresh"
+
+            refresh = oidc_client.post(
+                "/oauth/token",
+                json={
+                    "grant_type": "refresh_token",
+                    "refresh_token": "idp-refresh",
+                },
+            )
+            assert refresh.status_code == 200
+            assert mock_http.post.call_count == 2
+
+    get_settings.cache_clear()
+
+
+def test_oauth_callback_exchanges_stub_code(client: TestClient) -> None:
+    auth = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "demo",
+            "redirect_uri": "http://127.0.0.1:8000/oauth/callback",
+        },
+        follow_redirects=False,
+    )
+    assert auth.status_code == 302
+    loc = auth.headers["location"]
+    assert "code=" in loc
+    # Extract code from redirect query.
+    from urllib.parse import parse_qs, urlparse
+
+    qs = parse_qs(urlparse(loc).query)
+    code = qs["code"][0]
+
+    # Callback uses settings redirect_uri; stub code was bound to same URI.
+    cb = client.get("/oauth/callback", params={"code": code, "state": "s1"})
+    assert cb.status_code == 200
+    body = cb.json()
+    assert body["access_token"]
+    assert body["refresh_token"]
+    assert body["mode"] == "local_stub"
+    assert body["state"] == "s1"
+
+
+def test_zenith_client_admin_key_helpers(client: TestClient) -> None:
+    """Shared client helpers used by the Streamlit key portal."""
+    from zenith_client import ZenithApiClient, ZenithApiError
+
+    zc = ZenithApiClient(base_url="http://test", api_key="zenith_admin_key_manage")
+
+    def _patched_request(method: str, path: str, **kwargs):
+        response = client.request(method, path, headers=zc._headers(), **kwargs)
+        if response.status_code >= 400:
+            body = response.json()
+            raise ZenithApiError(
+                body.get("message", response.text),
+                status_code=response.status_code,
+                code=body.get("code"),
+            )
+        return response.json()
+
+    zc._request = _patched_request  # type: ignore[method-assign]
+    created = zc.create_api_key(
+        key_id="portal-partner", scopes=["layers:read"], label="p"
+    )
+    assert created["key_id"] == "portal-partner"
+    assert created["secret"].startswith("zenith_")
+    listed = zc.list_api_keys()
+    assert any(i["key_id"] == "portal-partner" for i in listed["items"])
+    revoked = zc.revoke_api_key("portal-partner")
+    assert revoked["revoked"] is True

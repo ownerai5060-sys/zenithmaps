@@ -1,4 +1,4 @@
-"""Zenith Maps Platform API entrypoint (M1–N6 + WFS-lite / vault / OIDC slice).
+"""Zenith Maps Platform API entrypoint (M1–O3 + key portal / OIDC auth-code).
 
 Architecture decision (M1)
 --------------------------
@@ -11,17 +11,20 @@ Run locally::
     uvicorn api.main:app --reload --port 8000
 
 Interactive OpenAPI docs: http://127.0.0.1:8000/docs
+Key portal (static): http://127.0.0.1:8000/admin/key-portal
 """
 
 from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -114,11 +117,12 @@ def create_app() -> FastAPI:
             "Stable HTTP API for Zenith Maps catalog, layer metadata, structured "
             "legends, allowlisted GetLegendGraphic, WFS-lite GeoJSON features "
             "(fixtures / optional PostGIS), allowlisted catalog tile URL "
-            "discovery, durable API-key vault, catalog webhooks with durable "
-            "subscription registry + delivery/retry log + HMAC stub, OAuth2 "
-            "client-credentials stub, and optional OIDC JWT (JWKS) Bearer "
-            "validation. GraphQL is deferred. Streamlit pages in this repo are "
-            "a UI demo; external apps should integrate against `/api/v1`."
+            "discovery, durable API-key vault, minimal key portal UI, catalog "
+            "webhooks with durable subscription registry + delivery/retry log + "
+            "HMAC stub, OAuth2 client_credentials + authorization_code/refresh "
+            "stubs (IdP proxy when configured), and optional OIDC JWT (JWKS) "
+            "Bearer validation. GraphQL is deferred. Streamlit pages in this "
+            "repo are a UI demo; external apps should integrate against `/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -167,6 +171,19 @@ def create_app() -> FastAPI:
     application.include_router(admin_keys.router, prefix="/api/v1")
     application.include_router(webhooks.router, prefix="/api/v1")
 
+    static_root = Path(__file__).resolve().parent.parent / "static"
+    if static_root.is_dir():
+        application.mount(
+            "/static",
+            StaticFiles(directory=str(static_root)),
+            name="static",
+        )
+
+    @application.get("/admin/key-portal", include_in_schema=True, tags=["admin"])
+    async def key_portal_redirect() -> RedirectResponse:
+        """Convenience alias for the static API-key portal UI."""
+        return RedirectResponse(url="/static/admin/key_portal.html", status_code=307)
+
     @application.get("/api/v1", include_in_schema=True, tags=["meta"])
     async def api_v1_root(request: Request) -> JSONResponse:
         return JSONResponse(
@@ -176,6 +193,7 @@ def create_app() -> FastAPI:
                 "package_version": __version__,
                 "docs": "/docs",
                 "graphql": "deferred",
+                "key_portal": "/admin/key-portal",
                 "endpoints": {
                     "layers": "/api/v1/layers",
                     "layer_detail": "/api/v1/layers/{layer_id}",
@@ -191,6 +209,10 @@ def create_app() -> FastAPI:
                     "admin_webhook_deliveries": "/api/v1/admin/webhooks/deliveries",
                     "admin_catalog": "/api/v1/admin/catalog",
                     "oauth_token": "/oauth/token",
+                    "oauth_authorize": "/oauth/authorize",
+                    "oauth_callback": "/oauth/callback",
+                    "oauth_oidc_config": "/oauth/oidc-config",
+                    "key_portal": "/admin/key-portal",
                     "healthz": "/healthz",
                     "metrics": "/metrics",
                     "metrics_prometheus": "/metrics/prometheus",
@@ -198,7 +220,13 @@ def create_app() -> FastAPI:
                 "auth": {
                     "api_key": "X-API-Key",
                     "oauth_opaque": "/oauth/token",
+                    "oauth_grants": [
+                        "client_credentials",
+                        "authorization_code",
+                        "refresh_token",
+                    ],
                     "oidc_jwt": bool(settings.oidc_jwks_url),
+                    "oidc_auth_code": bool(settings.oidc_token_url),
                 },
                 "features_mode": "wfs_lite",
                 "key_vault_durable": bool(settings.key_vault_path),
