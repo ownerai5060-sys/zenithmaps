@@ -11,7 +11,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import FrozenSet
+from typing import FrozenSet, Literal
 
 
 @dataclass(frozen=True)
@@ -24,9 +24,12 @@ class ApiKeyRecord:
     label: str = ""
 
 
+RateLimitBackendName = Literal["memory", "redis", "auto"]
+
+
 @dataclass(frozen=True)
 class Settings:
-    """Application settings (M3 auth, M6 allowlist, M7 CORS)."""
+    """Application settings (auth, allowlist, CORS, rate limit, observability)."""
 
     app_name: str = "Zenith Maps Platform API"
     api_version: str = "v1"
@@ -53,14 +56,24 @@ class Settings:
     api_keys: tuple[ApiKeyRecord, ...] = field(default_factory=tuple)
     # When True, reject any outbound/proxy pattern that is not allowlisted.
     enforce_wms_allowlist: bool = True
-    # Per-API-key fixed-window rate limit (S3).
+    # Per-API-key fixed-window rate limit (S3 + distributed backend).
     rate_limit_enabled: bool = True
     rate_limit_requests: int = 120
     rate_limit_window_s: int = 60
+    rate_limit_backend: RateLimitBackendName = "auto"
+    redis_url: str = ""
     # Health upstream probes (S2). Set false in unit tests / offline CI.
     health_check_upstreams: bool = True
     # Public base URL used in docs / legend graphic absolute links (optional).
     public_base_url: str = "http://127.0.0.1:8000"
+    # OAuth2 client-credentials stub.
+    oauth_enabled: bool = True
+    oauth_token_ttl_s: int = 3600
+    # Observability (env-driven).
+    prometheus_enabled: bool = True
+    otel_enabled: bool = False
+    otel_service_name: str = "zenith-api"
+    otel_exporter_otlp_endpoint: str = ""
 
 
 def _parse_csv(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -88,6 +101,12 @@ def _default_demo_keys() -> tuple[ApiKeyRecord, ...]:
             scopes=frozenset({"layers:read"}),
             label="Read-only integration key",
         ),
+        ApiKeyRecord(
+            key_id="admin",
+            secret="zenith_admin_key_manage",
+            scopes=frozenset({"layers:read", "admin:keys"}),
+            label="Admin key management (local/sandbox only)",
+        ),
     )
 
 
@@ -107,6 +126,20 @@ def _load_api_keys_from_env() -> tuple[ApiKeyRecord, ...] | None:
             )
         )
     return tuple(records)
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() not in {"0", "false", "no"}
+
+
+def _int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
 
 
 @lru_cache(maxsize=1)
@@ -130,17 +163,9 @@ def get_settings() -> Settings:
         os.getenv("ZENITH_WMS_ALLOWED_LAYERS"),
         ("WORLDCOVER_2020_MAP", "WORLDCOVER_2021_MAP"),
     )
-    def _bool(name: str, default: bool) -> bool:
-        raw = os.getenv(name)
-        if raw is None:
-            return default
-        return raw.lower() not in {"0", "false", "no"}
-
-    def _int(name: str, default: int) -> int:
-        raw = os.getenv(name)
-        if raw is None or raw.strip() == "":
-            return default
-        return int(raw)
+    backend_raw = (os.getenv("ZENITH_RATE_LIMIT_BACKEND") or "auto").strip().lower()
+    if backend_raw not in {"memory", "redis", "auto"}:
+        backend_raw = "auto"
 
     return Settings(
         cors_origins=cors,
@@ -151,8 +176,19 @@ def get_settings() -> Settings:
         rate_limit_enabled=_bool("ZENITH_RATE_LIMIT_ENABLED", True),
         rate_limit_requests=_int("ZENITH_RATE_LIMIT_REQUESTS", 120),
         rate_limit_window_s=_int("ZENITH_RATE_LIMIT_WINDOW_S", 60),
+        rate_limit_backend=backend_raw,  # type: ignore[arg-type]
+        redis_url=os.getenv("ZENITH_REDIS_URL", "").strip(),
         health_check_upstreams=_bool("ZENITH_HEALTH_CHECK_UPSTREAMS", True),
         public_base_url=os.getenv("ZENITH_PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip(
             "/"
         ),
+        oauth_enabled=_bool("ZENITH_OAUTH_ENABLED", True),
+        oauth_token_ttl_s=_int("ZENITH_OAUTH_TOKEN_TTL_S", 3600),
+        prometheus_enabled=_bool("ZENITH_PROMETHEUS_ENABLED", True),
+        otel_enabled=_bool("ZENITH_OTEL_ENABLED", False),
+        otel_service_name=os.getenv("ZENITH_OTEL_SERVICE_NAME", "zenith-api").strip()
+        or "zenith-api",
+        otel_exporter_otlp_endpoint=os.getenv(
+            "ZENITH_OTEL_EXPORTER_OTLP_ENDPOINT", ""
+        ).strip(),
     )
