@@ -19,10 +19,11 @@ for external applications.
 (عمداً به تعویق افتاده). کاشی‌ها فقط URLهای allowlist‌شدهٔ کاتالوگ هستند؛
 سیاست CDN: `docs/tile-cdn-policy.md` و env اختیاری `ZENITH_TILE_CDN_BASE_URLS`.
 
-**وضعیت آمادگی API:** `staging-ready` (package `0.11.0` — sandbox / پروتوتایپ خارجی).
-چرخش کلید مبتنی بر سیاست (cron CLI + endpoint ادمین)، پل SSO استریم‌لیت (محدودیت
-دامنهٔ کوکی صادقانه)، Redis/OTel پین‌شده در extras، و runbook عملیات در docs
-پروژه. موارد فقط‑پروداکشن باقی‌مانده: IdP واقعی، SLA، CDN عملیاتی، queue مدیریت‌شده.
+**وضعیت آمادگی API:** `staging-ready` (package `0.12.0` — sandbox / پروتوتایپ خارجی).
+چرخش کلید مبتنی بر سیاست، پل SSO استریم‌لیت، Redis/OTel extras، نمونهٔ
+`docker compose` (API+Redis+PostGIS+OTel)، و یادداشت sidecar خروجی webhook.
+موارد فقط‑پروداکشن باقی‌مانده: IdP واقعی، SLA، CDN عملیاتی، queue مدیریت‌شده،
+egress سازمانی.
 
 ---
 
@@ -60,7 +61,8 @@ uvicorn api.main:app --reload --port 8000
 - Policy rotation: `GET/PUT /api/v1/admin/keys/rotation-policy` + cron `python -m api.rotation_worker`
 - Streamlit SSO bridge: shared `ZENITH_PORTAL_COOKIE_DOMAIN` + `/oauth/portal/token-exchange` (see `zenith_client/sso_bridge.py`)
 - Optional Redis/OTel: `pip install -r requirements-api-extras.txt`; sample `docs/otel-collector.env.sample`
-- Webhook egress: soft SSRF blocks + optional `ZENITH_WEBHOOK_ALLOWED_HOSTS`
+- Local stack sample: `docker compose --env-file compose.env.sample up --build` (API + Redis + PostGIS + OTel collector)
+- Webhook egress: soft SSRF + `ZENITH_WEBHOOK_ALLOWED_HOSTS`; optional allowlist sidecar `docs/webhook-egress-proxy.md` (`--profile egress`)
 - Tile CDN policy stub: `ZENITH_TILE_CDN_BASE_URLS` (allowlist only; no hosted CDN)
 - OAuth/OIDC: `/oauth/token` supports `client_credentials`, `authorization_code`, `refresh_token`
   with PKCE S256; `/oauth/authorize` + `/oauth/callback` stub locally or proxy to IdP via `ZENITH_OIDC_*`

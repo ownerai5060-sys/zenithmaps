@@ -1,0 +1,110 @@
+# Local / staging sample stack: API + Redis + PostGIS + OTel collector.
+# Not a production SLA deployment — demo credentials and debug exporter only.
+#
+#   docker compose --env-file compose.env.sample up --build
+#   curl -s http://127.0.0.1:8000/healthz
+#
+# Optional webhook egress allowlist sidecar:
+#   docker compose --env-file compose.env.sample --profile egress up --build
+
+name: zenithmaps
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-zenith}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zenith_local_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-zenith}
+    ports:
+      - "5432:5432"
+    volumes:
+      - zenith_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zenith} -d ${POSTGRES_DB:-zenith}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./docs/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    environment:
+      ZENITH_PUBLIC_BASE_URL: ${ZENITH_PUBLIC_BASE_URL:-http://127.0.0.1:8000}
+      ZENITH_KEY_VAULT_PATH: ${ZENITH_KEY_VAULT_PATH:-/.data/keys.sqlite}
+      ZENITH_WEBHOOK_LOG_PATH: ${ZENITH_WEBHOOK_LOG_PATH:-/.data/webhooks.sqlite}
+      ZENITH_REDIS_URL: ${ZENITH_REDIS_URL:-redis://redis:6379/0}
+      ZENITH_DATABASE_URL: ${ZENITH_DATABASE_URL:-postgresql://zenith:zenith_local_change_me@postgis:5432/zenith}
+      ZENITH_MIGRATE_ON_START: ${ZENITH_MIGRATE_ON_START:-true}
+      ZENITH_RATE_LIMIT_BACKEND: ${ZENITH_RATE_LIMIT_BACKEND:-redis}
+      ZENITH_SESSION_STORE_BACKEND: ${ZENITH_SESSION_STORE_BACKEND:-redis}
+      ZENITH_OTEL_ENABLED: ${ZENITH_OTEL_ENABLED:-true}
+      ZENITH_OTEL_SERVICE_NAME: ${ZENITH_OTEL_SERVICE_NAME:-zenith-api}
+      ZENITH_OTEL_EXPORTER_OTLP_ENDPOINT: ${ZENITH_OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318/v1/traces}
+      ZENITH_HEALTH_CHECK_UPSTREAMS: ${ZENITH_HEALTH_CHECK_UPSTREAMS:-false}
+      ZENITH_WEBHOOK_ALLOWED_HOSTS: ${ZENITH_WEBHOOK_ALLOWED_HOSTS:-}
+      ZENITH_PROMETHEUS_ENABLED: ${ZENITH_PROMETHEUS_ENABLED:-true}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-redis,postgis,otel-collector,localhost,127.0.0.1}
+    ports:
+      - "8000:8000"
+    volumes:
+      - zenith_api_data:/.data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Optional DNS-rebinding-aware host allowlist forward proxy for webhook egress.
+  # Enable with: --profile egress
+  # Then set HTTP_PROXY/HTTPS_PROXY=http://egress-allowlist:8888 on `api`.
+  egress-allowlist:
+    profiles: ["egress"]
+    build:
+      context: ./deploy/egress-allowlist
+      dockerfile: Dockerfile
+    environment:
+      EGRESS_ALLOWED_HOSTS: ${EGRESS_ALLOWED_HOSTS:-hooks.example.com}
+      EGRESS_LISTEN: ${EGRESS_LISTEN:-0.0.0.0:8888}
+    ports:
+      - "8888:8888"
+
+volumes:
+  zenith_pgdata:
+  zenith_api_data:
