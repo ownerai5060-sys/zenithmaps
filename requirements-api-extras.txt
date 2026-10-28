@@ -4,8 +4,10 @@
 #
 # Redis: rate-limit + SSO session backends when ZENITH_REDIS_URL is set.
 redis==6.4.0
-# OpenTelemetry (enable with ZENITH_OTEL_ENABLED=true):
-opentelemetry-api==1.39.1
-opentelemetry-sdk==1.39.1
-opentelemetry-exporter-otlp==1.39.1
-opentelemetry-instrumentation-fastapi==0.60b1
+# OpenTelemetry (enable with ZENITH_OTEL_ENABLED=true).
+# Keep api/sdk/exporter aligned; instrumentation uses the matching 0.(api_minor+21)b* line.
+# FastAPI >=0.162 requires opentelemetry-api>=1.44.0.
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp==1.45.1
+opentelemetry-instrumentation-fastapi==0.66b1
