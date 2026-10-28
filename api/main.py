@@ -1,4 +1,4 @@
-"""Zenith Maps Platform API entrypoint (M1–M7).
+"""Zenith Maps Platform API entrypoint (M1–N6 + WFS-lite / vault / OIDC slice).
 
 Architecture decision (M1)
 --------------------------
@@ -15,6 +15,7 @@ Interactive OpenAPI docs: http://127.0.0.1:8000/docs
 
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -36,7 +37,25 @@ from api.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
-from api.routers import health, layers, security
+from api.catalog import reset_catalog_version
+from api.keystore import get_keystore
+from api.metrics import get_metrics
+from api.oauth import get_token_store
+from api.oidc import get_jwks_cache
+from api.otel import setup_otel
+from api.rate_limit import RateLimitHeaderMiddleware, reset_rate_limiter
+from api.routers import (
+    admin_keys,
+    features,
+    health,
+    layers,
+    oauth,
+    security,
+    tiles,
+    webhooks,
+)
+from api.webhook_log import get_delivery_log
+from api.webhooks import get_webhook_registry
 
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
@@ -51,10 +70,35 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Record per-request latency and error counts (S2 + Prometheus)."""
+
+    async def dispatch(self, request: Request, call_next):
+        started = time.perf_counter()
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - started) * 1000
+        is_error = response.status_code >= 500
+        get_metrics().record(
+            latency_ms=latency_ms,
+            is_error=is_error,
+            path=request.url.path,
+        )
+        return response
+
+
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
     # Eagerly load settings so misconfigured env fails at startup.
-    get_settings()
+    settings = get_settings()
+    get_metrics().reset()
+    get_keystore().reset_and_seed(settings.api_keys)
+    get_token_store().reset()
+    get_jwks_cache().reset()
+    get_webhook_registry().reset()
+    get_delivery_log().configure(settings.webhook_log_path)
+    reset_catalog_version(1)
+    reset_rate_limiter(settings)
+    setup_otel(app, settings)
     yield
 
 
@@ -64,9 +108,14 @@ def create_app() -> FastAPI:
         title=settings.app_name,
         version=__version__,
         description=(
-            "Stable HTTP API for Zenith Maps catalog, layer metadata, and "
-            "structured legends. Streamlit pages in this repo are a UI demo; "
-            "external apps should integrate against `/api/v1`."
+            "Stable HTTP API for Zenith Maps catalog, layer metadata, structured "
+            "legends, allowlisted GetLegendGraphic, WFS-lite GeoJSON features "
+            "(fixtures / optional PostGIS), allowlisted catalog tile URL "
+            "discovery, durable API-key vault, catalog webhooks with delivery "
+            "log + HMAC stub, OAuth2 client-credentials stub, and optional "
+            "OIDC JWT (JWKS) Bearer validation. GraphQL is deferred. Streamlit "
+            "pages in this repo are a UI demo; external apps should integrate "
+            "against `/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -78,10 +127,25 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
-        expose_headers=[REQUEST_ID_HEADER],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-API-Key",
+            "X-Request-ID",
+        ],
+        expose_headers=[
+            REQUEST_ID_HEADER,
+            "X-RateLimit-Limit",
+            "X-RateLimit-Remaining",
+            "X-RateLimit-Reset",
+            "X-RateLimit-Backend",
+            "Retry-After",
+        ],
     )
+    # Starlette applies middleware in reverse add order for requests.
+    application.add_middleware(RateLimitHeaderMiddleware)
+    application.add_middleware(MetricsMiddleware)
     application.add_middleware(RequestIdMiddleware)
 
     application.add_exception_handler(ApiError, api_error_handler)
@@ -92,8 +156,13 @@ def create_app() -> FastAPI:
     application.add_exception_handler(Exception, unhandled_exception_handler)
 
     application.include_router(health.router)
+    application.include_router(oauth.router)
     application.include_router(layers.router, prefix="/api/v1")
+    application.include_router(features.router, prefix="/api/v1")
+    application.include_router(tiles.router, prefix="/api/v1")
     application.include_router(security.router, prefix="/api/v1")
+    application.include_router(admin_keys.router, prefix="/api/v1")
+    application.include_router(webhooks.router, prefix="/api/v1")
 
     @application.get("/api/v1", include_in_schema=True, tags=["meta"])
     async def api_v1_root(request: Request) -> JSONResponse:
@@ -103,13 +172,34 @@ def create_app() -> FastAPI:
                 "version": settings.api_version,
                 "package_version": __version__,
                 "docs": "/docs",
+                "graphql": "deferred",
                 "endpoints": {
                     "layers": "/api/v1/layers",
                     "layer_detail": "/api/v1/layers/{layer_id}",
                     "legend": "/api/v1/layers/{layer_id}/legend",
+                    "legend_image": "/api/v1/layers/{layer_id}/legend/image",
+                    "features": "/api/v1/layers/{layer_id}/features",
+                    "tiles": "/api/v1/tiles",
+                    "tile_detail": "/api/v1/tiles/{layer_id}",
                     "check_url": "/api/v1/security/check-url",
                     "allowlist": "/api/v1/security/allowlist",
+                    "admin_keys": "/api/v1/admin/keys",
+                    "admin_webhooks": "/api/v1/admin/webhooks",
+                    "admin_webhook_deliveries": "/api/v1/admin/webhooks/deliveries",
+                    "admin_catalog": "/api/v1/admin/catalog",
+                    "oauth_token": "/oauth/token",
+                    "healthz": "/healthz",
+                    "metrics": "/metrics",
+                    "metrics_prometheus": "/metrics/prometheus",
                 },
+                "auth": {
+                    "api_key": "X-API-Key",
+                    "oauth_opaque": "/oauth/token",
+                    "oidc_jwt": bool(settings.oidc_jwks_url),
+                },
+                "features_mode": "wfs_lite",
+                "key_vault_durable": bool(settings.key_vault_path),
+                "webhook_log_durable": bool(settings.webhook_log_path),
                 "request_id": get_request_id(request),
             },
             headers={REQUEST_ID_HEADER: get_request_id(request)},

@@ -11,7 +11,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import FrozenSet
+from typing import FrozenSet, Literal
 
 
 @dataclass(frozen=True)
@@ -24,9 +24,12 @@ class ApiKeyRecord:
     label: str = ""
 
 
+RateLimitBackendName = Literal["memory", "redis", "auto"]
+
+
 @dataclass(frozen=True)
 class Settings:
-    """Application settings (M3 auth, M6 allowlist, M7 CORS)."""
+    """Application settings (auth, allowlist, CORS, rate limit, observability)."""
 
     app_name: str = "Zenith Maps Platform API"
     api_version: str = "v1"
@@ -37,12 +40,19 @@ class Settings:
         "http://localhost:8501",
         "http://127.0.0.1:8501",
     )
-    # Hostnames (lowercase, no port) that may appear in WMS/tile URLs (M6).
+    # Hostnames (lowercase, no port) that may appear in WMS/tile URLs (M6/N4).
+    # Includes catalog XYZ hosts already referenced by curated layers — not
+    # an open CDN invent list.
     wms_allowed_hosts: FrozenSet[str] = frozenset(
         {
             "services.terrascope.be",
+            "a.tile.opentopomap.org",
+            "b.tile.opentopomap.org",
+            "c.tile.opentopomap.org",
         }
     )
+    # When True, non-local webhook callback URLs must use https (N3).
+    webhooks_require_https: bool = True
     # Optional layer-name allowlist per host. Empty set = any layer on that host.
     wms_allowed_layers: FrozenSet[str] = frozenset(
         {
@@ -53,6 +63,37 @@ class Settings:
     api_keys: tuple[ApiKeyRecord, ...] = field(default_factory=tuple)
     # When True, reject any outbound/proxy pattern that is not allowlisted.
     enforce_wms_allowlist: bool = True
+    # Per-API-key fixed-window rate limit (S3 + distributed backend).
+    rate_limit_enabled: bool = True
+    rate_limit_requests: int = 120
+    rate_limit_window_s: int = 60
+    rate_limit_backend: RateLimitBackendName = "auto"
+    redis_url: str = ""
+    # Health upstream probes (S2). Set false in unit tests / offline CI.
+    health_check_upstreams: bool = True
+    # Public base URL used in docs / legend graphic absolute links (optional).
+    public_base_url: str = "http://127.0.0.1:8000"
+    # OAuth2 client-credentials stub.
+    oauth_enabled: bool = True
+    oauth_token_ttl_s: int = 3600
+    # Observability (env-driven).
+    prometheus_enabled: bool = True
+    otel_enabled: bool = False
+    otel_service_name: str = "zenith-api"
+    otel_exporter_otlp_endpoint: str = ""
+    # Durable key vault (SQLite path). Empty = in-process memory only.
+    key_vault_path: str = ""
+    # WFS-lite: optional PostGIS DSN; empty → fixtures / stubs.
+    database_url: str = ""
+    features_table: str = "zenith_features"
+    # OIDC / JWT via JWKS (optional alongside opaque OAuth stub tokens).
+    oidc_jwks_url: str = ""
+    oidc_audience: str = ""
+    oidc_issuer: str = ""
+    oidc_default_scopes: str = "layers:read"
+    # Webhook durability + HMAC signing stub.
+    webhook_log_path: str = ""
+    webhook_signing_secret: str = ""
 
 
 def _parse_csv(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -80,6 +121,12 @@ def _default_demo_keys() -> tuple[ApiKeyRecord, ...]:
             scopes=frozenset({"layers:read"}),
             label="Read-only integration key",
         ),
+        ApiKeyRecord(
+            key_id="admin",
+            secret="zenith_admin_key_manage",
+            scopes=frozenset({"layers:read", "admin:keys"}),
+            label="Admin key management (local/sandbox only)",
+        ),
     )
 
 
@@ -101,6 +148,20 @@ def _load_api_keys_from_env() -> tuple[ApiKeyRecord, ...] | None:
     return tuple(records)
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() not in {"0", "false", "no"}
+
+
+def _int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return cached settings built from env + safe defaults."""
@@ -116,17 +177,59 @@ def get_settings() -> Settings:
     )
     hosts = _parse_csv(
         os.getenv("ZENITH_WMS_ALLOWED_HOSTS"),
-        ("services.terrascope.be",),
+        (
+            "services.terrascope.be",
+            "a.tile.opentopomap.org",
+            "b.tile.opentopomap.org",
+            "c.tile.opentopomap.org",
+        ),
     )
     layers = _parse_csv(
         os.getenv("ZENITH_WMS_ALLOWED_LAYERS"),
         ("WORLDCOVER_2020_MAP", "WORLDCOVER_2021_MAP"),
     )
+    backend_raw = (os.getenv("ZENITH_RATE_LIMIT_BACKEND") or "auto").strip().lower()
+    if backend_raw not in {"memory", "redis", "auto"}:
+        backend_raw = "auto"
+
     return Settings(
         cors_origins=cors,
         wms_allowed_hosts=frozenset(h.lower() for h in hosts),
         wms_allowed_layers=frozenset(layers),
         api_keys=keys,
-        enforce_wms_allowlist=os.getenv("ZENITH_ENFORCE_WMS_ALLOWLIST", "true").lower()
-        not in {"0", "false", "no"},
+        enforce_wms_allowlist=_bool("ZENITH_ENFORCE_WMS_ALLOWLIST", True),
+        rate_limit_enabled=_bool("ZENITH_RATE_LIMIT_ENABLED", True),
+        rate_limit_requests=_int("ZENITH_RATE_LIMIT_REQUESTS", 120),
+        rate_limit_window_s=_int("ZENITH_RATE_LIMIT_WINDOW_S", 60),
+        rate_limit_backend=backend_raw,  # type: ignore[arg-type]
+        redis_url=os.getenv("ZENITH_REDIS_URL", "").strip(),
+        health_check_upstreams=_bool("ZENITH_HEALTH_CHECK_UPSTREAMS", True),
+        public_base_url=os.getenv("ZENITH_PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip(
+            "/"
+        ),
+        oauth_enabled=_bool("ZENITH_OAUTH_ENABLED", True),
+        oauth_token_ttl_s=_int("ZENITH_OAUTH_TOKEN_TTL_S", 3600),
+        prometheus_enabled=_bool("ZENITH_PROMETHEUS_ENABLED", True),
+        otel_enabled=_bool("ZENITH_OTEL_ENABLED", False),
+        otel_service_name=os.getenv("ZENITH_OTEL_SERVICE_NAME", "zenith-api").strip()
+        or "zenith-api",
+        otel_exporter_otlp_endpoint=os.getenv(
+            "ZENITH_OTEL_EXPORTER_OTLP_ENDPOINT", ""
+        ).strip(),
+        webhooks_require_https=_bool("ZENITH_WEBHOOKS_REQUIRE_HTTPS", True),
+        key_vault_path=os.getenv("ZENITH_KEY_VAULT_PATH", "").strip(),
+        database_url=os.getenv("ZENITH_DATABASE_URL", "").strip(),
+        features_table=(
+            os.getenv("ZENITH_FEATURES_TABLE", "zenith_features").strip()
+            or "zenith_features"
+        ),
+        oidc_jwks_url=os.getenv("ZENITH_OIDC_JWKS_URL", "").strip(),
+        oidc_audience=os.getenv("ZENITH_OIDC_AUDIENCE", "").strip(),
+        oidc_issuer=os.getenv("ZENITH_OIDC_ISSUER", "").strip(),
+        oidc_default_scopes=(
+            os.getenv("ZENITH_OIDC_DEFAULT_SCOPES", "layers:read").strip()
+            or "layers:read"
+        ),
+        webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
+        webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
     )

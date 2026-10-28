@@ -112,14 +112,23 @@ async def unhandled_exception_handler(
 class ApiError(Exception):
     """Raise inside route handlers for a controlled error envelope."""
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.headers = headers or {}
         super().__init__(message)
 
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
-    return error_response(
-        exc.status_code, exc.code, exc.message, get_request_id(request)
-    )
+    request_id = get_request_id(request)
+    response = error_response(exc.status_code, exc.code, exc.message, request_id)
+    for key, value in exc.headers.items():
+        response.headers[key] = value
+    return response

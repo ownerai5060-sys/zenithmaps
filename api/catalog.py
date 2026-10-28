@@ -6,6 +6,8 @@ URLs here must also pass the host/layer allowlist in ``api.security.allowlist``.
 
 from __future__ import annotations
 
+import threading
+import time
 from copy import deepcopy
 from typing import Any
 
@@ -16,6 +18,12 @@ from api.models import (
     LegendEntry,
     WmsSource,
 )
+
+# Monotonic catalog revision for webhook consumers (N3). Bumped explicitly
+# via admin API — in-memory only (resets on process restart).
+_catalog_lock = threading.Lock()
+_catalog_version: int = 1
+_catalog_updated_at: float = time.time()
 
 # ESA WorldCover class colors (same palette leafmap.builtin_legends uses).
 _ESA_WORLDCOVER_ENTRIES: list[LegendEntry] = [
@@ -143,8 +151,58 @@ def get_layer(layer_id: str) -> LayerDetail | None:
 def get_legend(layer_id: str) -> Legend | None:
     if layer_id not in _LAYERS:
         return None
-    return _LEGENDS.get(layer_id)
+    legend = _LEGENDS.get(layer_id)
+    if legend is None:
+        return None
+    # Enrich with GetLegendGraphic metadata when the layer has a WMS source (S1).
+    from api.legend_graphic import legend_graphic_url_for_layer
+
+    graphic = legend_graphic_url_for_layer(layer_id)
+    return legend.model_copy(
+        update={
+            "get_legend_graphic_url": graphic,
+            "legend_image_path": (
+                f"/api/v1/layers/{layer_id}/legend/image" if graphic else None
+            ),
+        }
+    )
 
 
 def known_layer_ids() -> frozenset[str]:
     return frozenset(_LAYERS.keys())
+
+
+def get_catalog_version() -> int:
+    with _catalog_lock:
+        return _catalog_version
+
+
+def get_catalog_meta() -> dict[str, Any]:
+    with _catalog_lock:
+        return {
+            "version": _catalog_version,
+            "updated_at": _catalog_updated_at,
+            "layer_count": len(_LAYERS),
+        }
+
+
+def bump_catalog_version(*, reason: str = "manual") -> dict[str, Any]:
+    """Increment catalog version (triggers webhook when caller notifies)."""
+    global _catalog_version, _catalog_updated_at
+    with _catalog_lock:
+        _catalog_version += 1
+        _catalog_updated_at = time.time()
+        return {
+            "version": _catalog_version,
+            "updated_at": _catalog_updated_at,
+            "reason": reason,
+            "layer_count": len(_LAYERS),
+        }
+
+
+def reset_catalog_version(version: int = 1) -> None:
+    """Test helper — reset revision counter."""
+    global _catalog_version, _catalog_updated_at
+    with _catalog_lock:
+        _catalog_version = version
+        _catalog_updated_at = time.time()

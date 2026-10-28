@@ -1,13 +1,15 @@
-"""Layers catalog, metadata, and structured legend (M2)."""
+"""Layers catalog, metadata, structured legend, and GetLegendGraphic (M2/S1)."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 
-from api.auth import Principal, require_scopes
+from api.auth import Principal
 from api.catalog import get_layer, get_legend, list_layer_summaries
 from api.errors import ApiError
+from api.legend_graphic import fetch_legend_graphic
 from api.models import LayerDetail, LayerListResponse, Legend
+from api.rate_limit import require_rate_limited
 from api.security.allowlist import check_wms_url
 
 router = APIRouter(prefix="/layers", tags=["layers"])
@@ -19,7 +21,7 @@ router = APIRouter(prefix="/layers", tags=["layers"])
     summary="List catalog layers",
 )
 def list_layers(
-    _principal: Principal = Depends(require_scopes("layers:read")),
+    _principal: Principal = Depends(require_rate_limited("layers:read")),
 ) -> LayerListResponse:
     items = list_layer_summaries()
     return LayerListResponse(items=items, count=len(items))
@@ -32,7 +34,7 @@ def list_layers(
 )
 def layer_detail(
     layer_id: str,
-    _principal: Principal = Depends(require_scopes("layers:read")),
+    _principal: Principal = Depends(require_rate_limited("layers:read")),
 ) -> LayerDetail:
     layer = get_layer(layer_id)
     if layer is None:
@@ -57,10 +59,15 @@ def layer_detail(
     "/{layer_id}/legend",
     response_model=Legend,
     summary="Get structured legend JSON",
+    description=(
+        "Returns categorical legend entries plus optional "
+        "`get_legend_graphic_url` (upstream OGC) and `legend_image_path` "
+        "(Zenith image proxy)."
+    ),
 )
 def layer_legend(
     layer_id: str,
-    _principal: Principal = Depends(require_scopes("layers:read")),
+    _principal: Principal = Depends(require_rate_limited("layers:read")),
 ) -> Legend:
     if get_layer(layer_id) is None:
         raise ApiError(
@@ -76,3 +83,29 @@ def layer_legend(
             message=f"No structured legend for layer '{layer_id}'",
         )
     return legend
+
+
+@router.get(
+    "/{layer_id}/legend/image",
+    summary="Proxy GetLegendGraphic image (allowlisted catalog only)",
+    description=(
+        "Fetches OGC GetLegendGraphic from the layer's allowlisted WMS source "
+        "and returns the image bytes. Does not accept arbitrary URLs (SSRF-safe)."
+    ),
+    responses={
+        200: {
+            "content": {"image/png": {}, "image/jpeg": {}, "image/gif": {}},
+            "description": "Legend graphic image",
+        }
+    },
+)
+def layer_legend_image(
+    layer_id: str,
+    _principal: Principal = Depends(require_rate_limited("layers:read")),
+) -> Response:
+    content, media_type = fetch_legend_graphic(layer_id)
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )

@@ -1,0 +1,46 @@
+name: API CI
+
+on:
+  push:
+    branches: [main, develop, "cursor/**"]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  lint-and-contract:
+    name: Lint + OpenAPI contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-api.txt
+            requirements-api.lock.txt
+
+      - name: Install API dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-api.txt
+
+      - name: Lint (ruff)
+        run: |
+          ruff check api tests zenith_client examples scripts
+
+      - name: Compile check
+        run: python -m compileall -q api zenith_client tests scripts sdk/python/zenith_maps
+
+      - name: Pytest (unit + OpenAPI contract)
+        env:
+          ZENITH_HEALTH_CHECK_UPSTREAMS: "false"
+          ZENITH_RATE_LIMIT_ENABLED: "true"
+          ZENITH_RATE_LIMIT_REQUESTS: "1000"
+          PYTHONPATH: sdk/python:.
+        run: pytest -q
+
+      - name: Export OpenAPI + Postman collection
+        run: python scripts/export_openapi_collection.py --out-dir artifacts/api-export

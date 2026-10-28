@@ -3,12 +3,31 @@
 Interactive Zenith map demos (Streamlit + leafmap) plus a **platform HTTP API**
 for external applications.
 
+## دربارهٔ زنیت / About Zenith (محصول)
+
+**زنیت** پلتفرم نقشه‌های تعاملی است: برای کاربر نهایی دموهای Streamlit، و برای
+اپ‌های دیگر یک **API پایدار** زیر `/api/v1`.
+
+| چه می‌خواهید؟ | از کجا شروع کنید؟ |
+|---------------|-------------------|
+| دیدن نقشه در مرورگر | `streamlit run Home.py` |
+| وصل کردن اپ خودتان به کاتالوگ لایه / legend / کاشی‌های تأییدشده | `uvicorn api.main:app` → `/docs` |
+| SDK نازک پایتون / JS | `sdk/python`, `sdk/js` |
+| خروجی Postman / OpenAPI | `python scripts/export_openapi_collection.py` |
+
+این مخزن **سرویس کاشی اختصاصی زنیت (WMTS/CDN) ندارد** و **GraphQL ندارد**
+(عمداً به تعویق افتاده). کاشی‌ها فقط همان URLهای allowlist‌شدهٔ کاتالوگ هستند.
+
+---
+
 ## Architecture
 
 | Surface | Path | Role |
 |---------|------|------|
 | UI demo | `Home.py`, `pages/` | Streamlit map demos — not a stable integration API |
-| Platform API | `api/` | FastAPI under `/api/v1` — catalog, metadata, legend JSON |
+| Platform API | `api/` | FastAPI under `/api/v1` — catalog, legend, WFS-lite features, tiles metadata, durable keys, webhooks, optional OIDC |
+| Shared client | `zenith_client/` | Helper used by Streamlit and examples |
+| Official SDK starters | `sdk/python`, `sdk/js` | Thin Python package + JS fetch helper (N2) |
 
 External apps should integrate against the API, not against Streamlit page
 routes. See OpenAPI at `/docs` when the API is running.
@@ -22,25 +41,56 @@ uvicorn api.main:app --reload --port 8000
 
 - Docs: http://127.0.0.1:8000/docs
 - Health: `GET /healthz`
-- Catalog: `GET /api/v1/layers` with header `X-API-Key: zenith_demo_key_layers_read`
+- Catalog: `GET /api/v1/layers` with `X-API-Key: zenith_demo_key_layers_read`
+- WFS-lite features: `GET /api/v1/layers/{id}/features` (fixtures; optional PostGIS via `ZENITH_DATABASE_URL`)
+- Allowlisted tile templates (N4): `GET /api/v1/tiles`
+- Admin webhooks + delivery log: `POST /api/v1/admin/webhooks`, `GET .../deliveries`
+- Durable key vault: set `ZENITH_KEY_VAULT_PATH` (SQLite) so admin-created keys survive restart
+- Optional OIDC JWT: set `ZENITH_OIDC_JWKS_URL` (+ audience/issuer) alongside opaque `/oauth/token`
 
 Demo API keys are stubs for local/third-party onboarding only. Override with
-`ZENITH_API_KEYS`, `ZENITH_CORS_ORIGINS`, `ZENITH_WMS_ALLOWED_HOSTS`, and
-`ZENITH_WMS_ALLOWED_LAYERS` in real deployments.
+`ZENITH_API_KEYS`, `ZENITH_KEY_VAULT_PATH`, `ZENITH_CORS_ORIGINS`,
+`ZENITH_WMS_ALLOWED_HOSTS`, `ZENITH_WMS_ALLOWED_LAYERS`, `ZENITH_RATE_LIMIT_*`,
+`ZENITH_DATABASE_URL`, `ZENITH_OIDC_*`, `ZENITH_WEBHOOK_*`, and
+`ZENITH_PUBLIC_BASE_URL` in real deployments.
 
 ```bash
 pytest
+ruff check api tests zenith_client examples scripts
 python examples/third_party_client.py   # requires API on :8000
+python scripts/export_openapi_collection.py --out-dir artifacts/api-export
+pip install -e sdk/python
 ```
 
-Sample browser client: `examples/third_party_client.html`
+Sample browser client: `examples/third_party_client.html`  
+JS helper: `sdk/js/zenith-maps.js`
+
+Pinned dependencies: `requirements-api.txt` + `requirements-api.lock.txt`.  
+CI: `.github/workflows/api-ci.yml` (lint + OpenAPI contract tests).
+
+### GraphQL (N5 — deferred)
+
+No GraphQL schema is shipped. Prefer REST `/api/v1` + OpenAPI. Revisit only if
+multiple clients need flexible field selection beyond the catalog/features surface.
+
+### Tiles / WMTS / XYZ (N4)
+
+Zenith does **not** operate a private tile CDN. `GET /api/v1/tiles` lists
+`tile_url_template` values already on catalog layers (e.g. OpenTopoMap) when
+their hosts are allowlisted. Clients fetch those upstreams directly — this API
+does not proxy open CDNs.
 
 ## Streamlit UI demo
 
 ```bash
 pip install -r requirements.txt
+# Start API in another terminal for catalog/legend pages:
+uvicorn api.main:app --port 8000
 streamlit run Home.py
 ```
+
+- `pages/6_📦_Web_Map_Service.py` — prefers API legends for catalog WMS layers
+- `pages/7_🗂️_API_Catalog.py` — thin client of `/api/v1`
 
 Based on the [opengeos/streamlit-map-template](https://github.com/opengeos/streamlit-map-template).
 
