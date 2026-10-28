@@ -81,7 +81,7 @@ def openapi_to_postman(openapi: dict[str, Any], *, base_url: str) -> dict[str, A
             "description": info.get("description") or "",
             "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
             "_postman_id": "zenith-maps-api-v1",
-            "version": info.get("version") or "0.4.0",
+            "version": info.get("version") or "0.5.0",
         },
         "variable": [
             {"key": "zenith_base_url", "value": base_url.rstrip("/")},

@@ -10,4 +10,4 @@ Or copy ``zenith_maps`` onto ``PYTHONPATH``. Requires ``httpx``.
 from zenith_maps.client import ZenithMapsClient
 
 __all__ = ["ZenithMapsClient"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

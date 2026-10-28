@@ -81,6 +81,19 @@ class Settings:
     otel_enabled: bool = False
     otel_service_name: str = "zenith-api"
     otel_exporter_otlp_endpoint: str = ""
+    # Durable key vault (SQLite path). Empty = in-process memory only.
+    key_vault_path: str = ""
+    # WFS-lite: optional PostGIS DSN; empty → fixtures / stubs.
+    database_url: str = ""
+    features_table: str = "zenith_features"
+    # OIDC / JWT via JWKS (optional alongside opaque OAuth stub tokens).
+    oidc_jwks_url: str = ""
+    oidc_audience: str = ""
+    oidc_issuer: str = ""
+    oidc_default_scopes: str = "layers:read"
+    # Webhook durability + HMAC signing stub.
+    webhook_log_path: str = ""
+    webhook_signing_secret: str = ""
 
 
 def _parse_csv(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -204,4 +217,19 @@ def get_settings() -> Settings:
             "ZENITH_OTEL_EXPORTER_OTLP_ENDPOINT", ""
         ).strip(),
         webhooks_require_https=_bool("ZENITH_WEBHOOKS_REQUIRE_HTTPS", True),
+        key_vault_path=os.getenv("ZENITH_KEY_VAULT_PATH", "").strip(),
+        database_url=os.getenv("ZENITH_DATABASE_URL", "").strip(),
+        features_table=(
+            os.getenv("ZENITH_FEATURES_TABLE", "zenith_features").strip()
+            or "zenith_features"
+        ),
+        oidc_jwks_url=os.getenv("ZENITH_OIDC_JWKS_URL", "").strip(),
+        oidc_audience=os.getenv("ZENITH_OIDC_AUDIENCE", "").strip(),
+        oidc_issuer=os.getenv("ZENITH_OIDC_ISSUER", "").strip(),
+        oidc_default_scopes=(
+            os.getenv("ZENITH_OIDC_DEFAULT_SCOPES", "layers:read").strip()
+            or "layers:read"
+        ),
+        webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
+        webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
     )

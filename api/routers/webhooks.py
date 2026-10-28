@@ -12,6 +12,7 @@ from api.catalog import bump_catalog_version, get_catalog_meta
 from api.errors import ApiError
 from api.models import CatalogBumpResponse, CatalogMeta
 from api.rate_limit import require_rate_limited
+from api.webhook_log import get_delivery_log
 from api.webhooks import (
     get_webhook_registry,
     notify_catalog_updated,
@@ -49,6 +50,24 @@ class WebhookListResponse(BaseModel):
 
 class WebhookPingResponse(BaseModel):
     delivery: dict[str, Any]
+
+
+class DeliveryPublic(BaseModel):
+    id: str
+    webhook_id: str
+    event: str
+    url: str
+    status: str
+    http_status: Optional[int] = None
+    error: Optional[str] = None
+    occurred_at: float
+    signature_header: Optional[str] = None
+
+
+class DeliveryListResponse(BaseModel):
+    items: list[DeliveryPublic]
+    count: int
+    durable: bool = False
 
 
 class CatalogBumpRequest(BaseModel):
@@ -107,6 +126,39 @@ def register_webhook(
     except KeyError as exc:
         raise ApiError(status_code=409, code="conflict", message=str(exc)) from exc
     return _public(sub)
+
+
+@router.get(
+    "/webhooks/deliveries",
+    response_model=DeliveryListResponse,
+    summary="List recent webhook delivery attempts",
+)
+def list_deliveries(
+    limit: int = 50,
+    webhook_id: Optional[str] = None,
+    _principal: Principal = Depends(require_rate_limited("admin:keys")),
+) -> DeliveryListResponse:
+    # Registered before /webhooks/{webhook_id} so "deliveries" is not captured.
+    log = get_delivery_log()
+    items = [
+        DeliveryPublic(
+            id=r.id,
+            webhook_id=r.webhook_id,
+            event=r.event,
+            url=r.url,
+            status=r.status,
+            http_status=r.http_status,
+            error=r.error,
+            occurred_at=r.occurred_at,
+            signature_header=r.signature_header,
+        )
+        for r in log.list_recent(limit=min(max(limit, 1), 500), webhook_id=webhook_id)
+    ]
+    return DeliveryListResponse(
+        items=items,
+        count=len(items),
+        durable=bool(log.path) or log.durable,
+    )
 
 
 @router.delete(

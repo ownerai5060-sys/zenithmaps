@@ -25,7 +25,7 @@ for external applications.
 | Surface | Path | Role |
 |---------|------|------|
 | UI demo | `Home.py`, `pages/` | Streamlit map demos — not a stable integration API |
-| Platform API | `api/` | FastAPI under `/api/v1` — catalog, legend, stub features, tiles metadata, webhooks |
+| Platform API | `api/` | FastAPI under `/api/v1` — catalog, legend, WFS-lite features, tiles metadata, durable keys, webhooks, optional OIDC |
 | Shared client | `zenith_client/` | Helper used by Streamlit and examples |
 | Official SDK starters | `sdk/python`, `sdk/js` | Thin Python package + JS fetch helper (N2) |
 
@@ -42,14 +42,17 @@ uvicorn api.main:app --reload --port 8000
 - Docs: http://127.0.0.1:8000/docs
 - Health: `GET /healthz`
 - Catalog: `GET /api/v1/layers` with `X-API-Key: zenith_demo_key_layers_read`
-- Stub features (N1): `GET /api/v1/layers/{id}/features`
+- WFS-lite features: `GET /api/v1/layers/{id}/features` (fixtures; optional PostGIS via `ZENITH_DATABASE_URL`)
 - Allowlisted tile templates (N4): `GET /api/v1/tiles`
-- Admin webhooks (N3): `POST /api/v1/admin/webhooks` (scope `admin:keys`)
+- Admin webhooks + delivery log: `POST /api/v1/admin/webhooks`, `GET .../deliveries`
+- Durable key vault: set `ZENITH_KEY_VAULT_PATH` (SQLite) so admin-created keys survive restart
+- Optional OIDC JWT: set `ZENITH_OIDC_JWKS_URL` (+ audience/issuer) alongside opaque `/oauth/token`
 
 Demo API keys are stubs for local/third-party onboarding only. Override with
-`ZENITH_API_KEYS`, `ZENITH_CORS_ORIGINS`, `ZENITH_WMS_ALLOWED_HOSTS`,
-`ZENITH_WMS_ALLOWED_LAYERS`, `ZENITH_RATE_LIMIT_*`, and `ZENITH_PUBLIC_BASE_URL`
-in real deployments.
+`ZENITH_API_KEYS`, `ZENITH_KEY_VAULT_PATH`, `ZENITH_CORS_ORIGINS`,
+`ZENITH_WMS_ALLOWED_HOSTS`, `ZENITH_WMS_ALLOWED_LAYERS`, `ZENITH_RATE_LIMIT_*`,
+`ZENITH_DATABASE_URL`, `ZENITH_OIDC_*`, `ZENITH_WEBHOOK_*`, and
+`ZENITH_PUBLIC_BASE_URL` in real deployments.
 
 ```bash
 pytest

@@ -1,0 +1,15 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "opentopomap-center",
+      "geometry": { "type": "Point", "coordinates": [0.0, 0.0] },
+      "properties": {
+        "layer_id": "opentopomap",
+        "note": "XYZ basemap — no vector attributes; fixture marker only.",
+        "source": "fixture"
+      }
+    }
+  ]
+}
