@@ -5,8 +5,9 @@ Supports:
 - ``authorization_code`` / ``refresh_token`` (IdP proxy when configured, else local stub)
 - PKCE S256 on the auth-code flow (required when challenge supplied / when configured)
 - ``GET /oauth/authorize`` and ``GET /oauth/callback`` for the auth-code redirect flow
+- Local consent stub: ``GET/POST /oauth/consent`` (auth-code + redirect_uri)
 - Portal session helpers: ``/oauth/portal/login|callback|logout|session``
-  (HttpOnly cookie so the key portal need not paste an admin key)
+  (HttpOnly cookie = opaque SSO session_id; IdP refresh kept server-side)
 """
 
 from __future__ import annotations
@@ -16,11 +17,17 @@ from typing import Any, Optional
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from api.auth import Principal, require_api_key
 from api.config import Settings, get_settings
+from api.consent import (
+    get_consent_store,
+    redirect_with_code,
+    redirect_with_error,
+    render_consent_html,
+)
 from api.csrf import new_csrf_token, portal_cookies_secure
 from api.errors import REQUEST_ID_HEADER, ApiError, get_request_id
 from api.oauth import (
@@ -37,6 +44,7 @@ from api.oidc_flow import (
     refresh_with_idp,
 )
 from api.pkce import code_challenge_s256, generate_code_verifier
+from api.session_store import get_session_store
 
 router = APIRouter(tags=["oauth"])
 
@@ -116,6 +124,51 @@ def _issue_client_credentials(
     )
 
 
+def _wrap_idp_token_response(
+    body: dict[str, Any], settings: Settings
+) -> dict[str, Any]:
+    """Return client tokens; persist IdP refresh server-side as opaque handle."""
+    scope = str(body.get("scope") or settings.oidc_scopes or "")
+    scopes = frozenset(s for s in scope.split() if s) or frozenset(
+        s for s in settings.oidc_default_scopes.split() if s
+    )
+    subject = str(
+        body.get("sub")
+        or body.get("client_id")
+        or settings.oidc_client_id
+        or "idp"
+    )
+    key_id = subject if subject.startswith("oidc:") else f"oidc:{subject}"
+    result: dict[str, Any] = {
+        "access_token": body["access_token"],
+        "token_type": body.get("token_type", "Bearer"),
+        "expires_in": int(body.get("expires_in") or settings.oauth_token_ttl_s),
+        "scope": scope or " ".join(sorted(scopes)),
+        "_key_id": key_id,
+        "_scopes": scopes,
+        "_label": f"OIDC {subject}",
+        "_idp_access_token": str(body.get("access_token") or ""),
+        "_idp_refresh_token": str(body.get("refresh_token") or ""),
+    }
+    raw_refresh = body.get("refresh_token")
+    if raw_refresh:
+        stored = get_session_store().store_idp_refresh(
+            idp_refresh_token=str(raw_refresh),
+            key_id=key_id,
+            scopes=scopes,
+            label=result["_label"],
+            ttl_s=settings.oauth_refresh_ttl_s,
+        )
+        result["refresh_token"] = stored.handle
+        result["_refresh_persisted"] = True
+    return result
+
+
+def _public_token_view(result: dict[str, Any]) -> dict[str, Any]:
+    """Strip internal keys before JSON responses."""
+    return {k: v for k, v in result.items() if not k.startswith("_")}
+
+
 def _issue_authorization_code(
     *,
     code: str,
@@ -141,17 +194,7 @@ def _issue_authorization_code(
                     or "IdP authorization_code exchange failed"
                 ),
             )
-        return {
-            "access_token": body["access_token"],
-            "token_type": body.get("token_type", "Bearer"),
-            "expires_in": int(body.get("expires_in") or settings.oauth_token_ttl_s),
-            "scope": body.get("scope") or settings.oidc_scopes,
-            **(
-                {"refresh_token": body["refresh_token"]}
-                if body.get("refresh_token")
-                else {}
-            ),
-        }
+        return _wrap_idp_token_response(body, settings)
 
     pair = exchange_stub_authorization_code(
         code,
@@ -166,12 +209,19 @@ def _issue_authorization_code(
             code="invalid_grant",
             message="Invalid or expired authorization code (or PKCE mismatch)",
         )
-    return _token_json(
-        access_token=pair.access.token,
-        expires_in=pair.expires_in_s,
-        scope=" ".join(sorted(pair.access.scopes)),
-        refresh_token=pair.refresh.token if pair.refresh else None,
-    )
+    return {
+        **_token_json(
+            access_token=pair.access.token,
+            expires_in=pair.expires_in_s,
+            scope=" ".join(sorted(pair.access.scopes)),
+            refresh_token=pair.refresh.token if pair.refresh else None,
+        ),
+        "_key_id": pair.access.key_id,
+        "_scopes": pair.access.scopes,
+        "_label": pair.access.label,
+        "_idp_access_token": "",
+        "_idp_refresh_token": "",
+    }
 
 
 def _issue_refresh_token(
@@ -179,7 +229,40 @@ def _issue_refresh_token(
     refresh_token: str,
     settings: Settings,
 ) -> dict[str, Any]:
+    # Prefer server-side IdP refresh handle (opaque) when present.
+    stored = get_session_store().consume_idp_refresh(refresh_token)
+    if stored is not None:
+        if not oidc_client_configured(settings):
+            raise ApiError(
+                status_code=400,
+                code="invalid_grant",
+                message="Stored IdP refresh requires ZENITH_OIDC_TOKEN_URL",
+            )
+        body = refresh_with_idp(
+            settings, refresh_token=stored.idp_refresh_token
+        )
+        if "error" in body or body.get("_http_status"):
+            status = int(body.pop("_http_status", 401))
+            raise ApiError(
+                status_code=status if status < 500 else 502,
+                code=str(body.get("error") or "invalid_grant"),
+                message=str(
+                    body.get("error_description")
+                    or body.get("message")
+                    or "IdP refresh_token exchange failed"
+                ),
+            )
+        # Carry forward subject / scopes if IdP omits them.
+        body.setdefault("scope", " ".join(sorted(stored.scopes)))
+        if "sub" not in body and stored.key_id.startswith("oidc:"):
+            body["sub"] = stored.key_id.split(":", 1)[1]
+        # If IdP did not rotate refresh, re-persist the same one under new handle.
+        if not body.get("refresh_token"):
+            body["refresh_token"] = stored.idp_refresh_token
+        return _public_token_view(_wrap_idp_token_response(body, settings))
+
     if oidc_client_configured(settings):
+        # Compat: client still holding a raw IdP refresh (pre-persistence).
         body = refresh_with_idp(settings, refresh_token=refresh_token)
         if "error" in body or body.get("_http_status"):
             status = int(body.pop("_http_status", 401))
@@ -192,17 +275,7 @@ def _issue_refresh_token(
                     or "IdP refresh_token exchange failed"
                 ),
             )
-        return {
-            "access_token": body["access_token"],
-            "token_type": body.get("token_type", "Bearer"),
-            "expires_in": int(body.get("expires_in") or settings.oauth_token_ttl_s),
-            "scope": body.get("scope") or settings.oidc_scopes,
-            **(
-                {"refresh_token": body["refresh_token"]}
-                if body.get("refresh_token")
-                else {}
-            ),
-        }
+        return _public_token_view(_wrap_idp_token_response(body, settings))
 
     pair = get_token_store().consume_refresh(
         refresh_token,
@@ -262,11 +335,13 @@ def _issue(
                 code="bad_request",
                 message="code is required for authorization_code",
             )
-        return _issue_authorization_code(
-            code=code,
-            redirect_uri=redirect_uri,
-            code_verifier=code_verifier,
-            settings=settings,
+        return _public_token_view(
+            _issue_authorization_code(
+                code=code,
+                redirect_uri=redirect_uri,
+                code_verifier=code_verifier,
+                settings=settings,
+            )
         )
     if gt == "refresh_token":
         if not refresh_token:
@@ -312,21 +387,22 @@ def _normalize_pkce(
 
 
 def _set_portal_cookie(
-    response: Response, settings: Settings, access_token: str, *, max_age: int
+    response: Response, settings: Settings, session_id: str, *, max_age: int
 ) -> None:
-    """Set HttpOnly session cookie + readable CSRF double-submit cookie.
+    """Set HttpOnly SSO session cookie + readable CSRF double-submit cookie.
 
     Cookie notes (staging/prod):
     - Session: HttpOnly, SameSite=Lax, Path=/, Secure when public base is https
-      (or ``ZENITH_PORTAL_COOKIE_SECURE=true``). Prefer real IdP sessions in prod.
+      (or ``ZENITH_PORTAL_COOKIE_SECURE=true``). Value is opaque ``session_id``
+      resolved via the shared session store (Redis / SQLite / memory).
     - CSRF: NOT HttpOnly so portal JS can mirror it into ``X-CSRF-Token``.
-    - Not a full shared SSO session store — opaque token (or IdP access token).
+    - IdP refresh tokens stay server-side in the session / refresh store.
     """
     secure = portal_cookies_secure(settings)
     age = max(60, max_age)
     response.set_cookie(
         key=settings.portal_cookie_name,
-        value=access_token,
+        value=session_id,
         httponly=True,
         samesite="lax",
         secure=secure,
@@ -345,7 +421,11 @@ def _set_portal_cookie(
         )
 
 
-def _clear_portal_cookies(response: Response, settings: Settings) -> None:
+def _clear_portal_cookies(
+    response: Response, settings: Settings, *, session_id: str | None = None
+) -> None:
+    if session_id:
+        get_session_store().delete_session(session_id)
     response.delete_cookie(settings.portal_cookie_name, path="/")
     response.delete_cookie(settings.portal_pkce_cookie_name, path="/")
     response.delete_cookie(settings.portal_csrf_cookie_name, path="/")
@@ -459,6 +539,22 @@ async def authorize_endpoint(
         return RedirectResponse(url=target, status_code=302)
 
     # Local stub: mint a one-time code for client_id (= API key_id).
+    # With redirect_uri + consent enabled → HTML consent stub first.
+    if redirect_uri and settings.oauth_consent_enabled:
+        pending = get_consent_store().create(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scope=scope or "",
+            state=state or "",
+            code_challenge=challenge,
+            code_challenge_method=method,
+        )
+        return HTMLResponse(
+            content=render_consent_html(pending),
+            status_code=200,
+            headers={REQUEST_ID_HEADER: get_request_id(request)},
+        )
+
     auth = issue_stub_authorization_code(
         client_id,
         redirect_uri=redirect_uri or settings.oidc_redirect_uri,
@@ -474,12 +570,11 @@ async def authorize_endpoint(
         )
 
     if redirect_uri:
-        params = {"code": auth.code}
-        if state:
-            params["state"] = state
-        sep = "&" if "?" in redirect_uri else "?"
         return RedirectResponse(
-            url=f"{redirect_uri}{sep}{urlencode(params)}", status_code=302
+            url=redirect_with_code(
+                redirect_uri, code=auth.code, state=state or ""
+            ),
+            status_code=302,
         )
 
     return JSONResponse(
@@ -556,12 +651,112 @@ async def callback_endpoint(
     )
     return JSONResponse(
         {
-            **result,
+            **_public_token_view(result),
             "state": state,
             "mode": "idp" if oidc_client_configured(settings) else "local_stub",
+            "refresh_persisted": bool(result.get("_refresh_persisted")),
             "request_id": get_request_id(request),
         },
         headers={REQUEST_ID_HEADER: get_request_id(request)},
+    )
+
+
+@router.get(
+    "/oauth/consent",
+    summary="Local-stub consent screen (pending_id)",
+    response_class=HTMLResponse,
+)
+async def consent_get(
+    request: Request,
+    pending_id: str = Query(...),
+    settings: Settings = Depends(get_settings),
+):
+    if not settings.oauth_enabled:
+        raise ApiError(
+            status_code=503,
+            code="service_unavailable",
+            message="OAuth is disabled",
+        )
+    pending = get_consent_store().get(pending_id)
+    if pending is None:
+        raise ApiError(
+            status_code=400,
+            code="invalid_request",
+            message="Unknown or expired consent request",
+        )
+    return HTMLResponse(
+        content=render_consent_html(pending),
+        headers={REQUEST_ID_HEADER: get_request_id(request)},
+    )
+
+
+@router.post(
+    "/oauth/consent",
+    summary="Approve or deny local-stub consent",
+)
+async def consent_post(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+):
+    if not settings.oauth_enabled:
+        raise ApiError(
+            status_code=503,
+            code="service_unavailable",
+            message="OAuth is disabled",
+        )
+    # Prefer form body (HTML stub); also accept JSON for tests / clients.
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        payload = await request.json()
+        pending_id = str(payload.get("pending_id") or "")
+        decision = str(payload.get("decision") or "deny")
+    else:
+        form = await request.form()
+        pending_id = str(form.get("pending_id") or "")
+        decision = str(form.get("decision") or "deny")
+    if not pending_id:
+        raise ApiError(
+            status_code=400,
+            code="invalid_request",
+            message="pending_id is required",
+        )
+    pending = get_consent_store().consume(pending_id)
+    if pending is None:
+        raise ApiError(
+            status_code=400,
+            code="invalid_request",
+            message="Unknown or expired consent request",
+        )
+    if (decision or "").strip().lower() != "approve":
+        return RedirectResponse(
+            url=redirect_with_error(
+                pending.redirect_uri,
+                error="access_denied",
+                state=pending.state,
+            ),
+            status_code=302,
+        )
+    auth = issue_stub_authorization_code(
+        pending.client_id,
+        redirect_uri=pending.redirect_uri,
+        requested_scope=pending.scope or None,
+        code_challenge=pending.code_challenge,
+        code_challenge_method=pending.code_challenge_method,
+    )
+    if auth is None:
+        return RedirectResponse(
+            url=redirect_with_error(
+                pending.redirect_uri,
+                error="invalid_client",
+                state=pending.state,
+            ),
+            status_code=302,
+        )
+    return RedirectResponse(
+        url=redirect_with_code(
+            pending.redirect_uri, code=auth.code, state=pending.state
+        ),
+        status_code=302,
     )
 
 
@@ -704,12 +899,27 @@ async def portal_callback(
         if maybe.startswith("/"):
             return_to = maybe
 
+    ttl = int(result.get("expires_in") or settings.oauth_token_ttl_s)
+    scopes = result.get("_scopes")
+    if not isinstance(scopes, frozenset):
+        scope_str = str(result.get("scope") or "")
+        scopes = frozenset(s for s in scope_str.split() if s)
+    session = get_session_store().create_session(
+        key_id=str(result.get("_key_id") or "unknown"),
+        scopes=scopes,
+        label=str(result.get("_label") or ""),
+        ttl_s=ttl,
+        access_token=str(result.get("access_token") or ""),
+        idp_access_token=str(result.get("_idp_access_token") or ""),
+        idp_refresh_token=str(result.get("_idp_refresh_token") or ""),
+    )
+
     response = RedirectResponse(url=return_to, status_code=302)
     _set_portal_cookie(
         response,
         settings,
-        result["access_token"],
-        max_age=int(result.get("expires_in") or settings.oauth_token_ttl_s),
+        session.session_id,
+        max_age=ttl,
     )
     response.delete_cookie(settings.portal_pkce_cookie_name, path="/")
     return response
@@ -727,6 +937,8 @@ async def portal_logout(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> JSONResponse:
+    cookie_name = settings.portal_cookie_name or "zenith_portal_token"
+    session_id = (request.cookies.get(cookie_name) or "").strip() or None
     response = JSONResponse(
         {
             "ok": True,
@@ -735,7 +947,7 @@ async def portal_logout(
         },
         headers={REQUEST_ID_HEADER: get_request_id(request)},
     )
-    _clear_portal_cookies(response, settings)
+    _clear_portal_cookies(response, settings, session_id=session_id)
     return response
 
 
@@ -747,6 +959,12 @@ async def portal_session(
     request: Request,
     principal: Principal = Depends(require_api_key),
 ) -> JSONResponse:
+    store = get_session_store()
+    session_meta = None
+    if principal.session_id:
+        rec = store.get_session(principal.session_id)
+        if rec is not None:
+            session_meta = rec.to_public_dict()
     return JSONResponse(
         {
             "authenticated": True,
@@ -754,6 +972,9 @@ async def portal_session(
             "scopes": sorted(principal.scopes),
             "label": principal.label,
             "auth_via": principal.auth_via,
+            "session_id": principal.session_id or None,
+            "session": session_meta,
+            "session_store": store.backend_name,
             "can_list_keys": bool(
                 {"keys:read", "admin:keys"} & set(principal.scopes)
             ),
@@ -791,6 +1012,7 @@ async def oidc_config_endpoint(
             "authorize": "/oauth/authorize",
             "token": "/oauth/token",
             "callback": "/oauth/callback",
+            "consent_path": "/oauth/consent",
             "portal_login": "/oauth/portal/login",
             "portal_callback": PORTAL_CALLBACK_PATH,
             "portal_logout": "/oauth/portal/logout",
@@ -817,12 +1039,26 @@ async def oidc_config_endpoint(
                 "csrf_enabled": settings.portal_csrf_enabled,
                 "secure": portal_cookies_secure(settings),
                 "samesite": "lax",
+                "value": "opaque_session_id",
                 "notes": (
-                    "Session is HttpOnly; CSRF is double-submit (readable cookie "
-                    "+ X-CSRF-Token). Secure follows ZENITH_PORTAL_COOKIE_SECURE "
-                    "or https public base URL."
+                    "Session cookie holds opaque SSO session_id (HttpOnly); "
+                    "CSRF is double-submit (readable cookie + X-CSRF-Token). "
+                    "Secure follows ZENITH_PORTAL_COOKIE_SECURE or https "
+                    "public base URL. IdP refresh tokens are server-side only."
                 ),
             },
+            "session_store": {
+                "backend": get_session_store().backend_name,
+                "configured_backend": settings.session_store_backend,
+                "path_set": bool(settings.session_store_path),
+                "redis_url_set": bool(settings.redis_url),
+            },
+            "consent": {
+                "enabled": settings.oauth_consent_enabled,
+                "path": "/oauth/consent",
+                "applies_to": "local_stub_authorize_with_redirect_uri",
+            },
+            "idp_refresh_persistence": True,
             "mode": (
                 "idp"
                 if oidc_client_configured(settings)

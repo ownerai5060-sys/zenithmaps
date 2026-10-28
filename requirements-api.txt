@@ -13,6 +13,8 @@ PyJWT==2.10.1
 cryptography==44.0.2
 # PostGIS WFS-lite path (api/features.py); safe no-op when ZENITH_DATABASE_URL unset.
 psycopg[binary]==3.2.9
+# OAuth form bodies (token + local consent stub).
+python-multipart==0.0.20
 # Optional (install when enabling Redis rate limits or OTel):
 # redis==6.4.0
 # opentelemetry-api==1.39.1
