@@ -43,6 +43,8 @@ def build_authorize_redirect_url(
     state: str | None = None,
     scope: str | None = None,
     redirect_uri: str | None = None,
+    code_challenge: str | None = None,
+    code_challenge_method: str = "S256",
     extra: dict[str, str] | None = None,
 ) -> str:
     """Build the IdP authorize URL (caller performs the HTTP redirect)."""
@@ -55,6 +57,11 @@ def build_authorize_redirect_url(
     }
     if state:
         params["state"] = state
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = (
+            code_challenge_method or "S256"
+        ).upper()
     if extra:
         params.update({k: v for k, v in extra.items() if v})
     sep = "&" if "?" in base else "?"
@@ -66,18 +73,19 @@ def exchange_code_with_idp(
     *,
     code: str,
     redirect_uri: str | None = None,
+    code_verifier: str | None = None,
 ) -> dict[str, Any]:
     """POST authorization_code grant to the configured IdP token URL."""
-    return _idp_token_request(
-        settings,
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": (redirect_uri or settings.oidc_redirect_uri or "").strip(),
-            "client_id": settings.oidc_client_id,
-            "client_secret": settings.oidc_client_secret,
-        },
-    )
+    form: dict[str, str] = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": (redirect_uri or settings.oidc_redirect_uri or "").strip(),
+        "client_id": settings.oidc_client_id,
+        "client_secret": settings.oidc_client_secret,
+    }
+    if code_verifier:
+        form["code_verifier"] = code_verifier
+    return _idp_token_request(settings, form)
 
 
 def refresh_with_idp(

@@ -56,6 +56,10 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
         "/oauth/authorize",
         "/oauth/callback",
         "/oauth/oidc-config",
+        "/oauth/portal/login",
+        "/oauth/portal/callback",
+        "/oauth/portal/logout",
+        "/oauth/portal/session",
         "/admin/key-portal",
         "/api/v1/layers",
         "/api/v1/layers/{layer_id}",
@@ -68,6 +72,7 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
         "/api/v1/security/allowlist",
         "/api/v1/admin/keys",
         "/api/v1/admin/keys/{key_id}",
+        "/api/v1/admin/keys/{key_id}/rotate",
         "/api/v1/admin/webhooks",
         "/api/v1/admin/webhooks/deliveries",
         "/api/v1/admin/catalog",
@@ -703,7 +708,7 @@ def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
     assert "admin_webhook_deliveries" in body["endpoints"]
     assert body["webhook_registry_durable"] is True
     assert body["webhook_retry_enabled"] is True
-    assert body["package_version"] == "0.7.0"
+    assert body["package_version"] == "0.8.0"
 
 
 def test_webhook_registry_survives_reconfigure(
@@ -1050,5 +1055,168 @@ def test_zenith_client_admin_key_helpers(client: TestClient) -> None:
     assert created["secret"].startswith("zenith_")
     listed = zc.list_api_keys()
     assert any(i["key_id"] == "portal-partner" for i in listed["items"])
+    rotated = zc.rotate_api_key("portal-partner")
+    assert rotated["secret"].startswith("zenith_")
+    assert rotated["secret"] != created["secret"]
     revoked = zc.revoke_api_key("portal-partner")
     assert revoked["revoked"] is True
+
+
+def test_oauth_pkce_s256_local_stub(client: TestClient) -> None:
+    """Auth-code + PKCE S256: challenge at authorize, verifier at token."""
+    from api.pkce import code_challenge_s256, generate_code_verifier
+
+    verifier = generate_code_verifier()
+    challenge = code_challenge_s256(verifier)
+    auth = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "demo",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+    )
+    assert auth.status_code == 200
+    assert auth.json()["pkce"] is True
+    code = auth.json()["code"]
+
+    bad = client.post(
+        "/oauth/token",
+        json={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": "wrong-verifier-value-xxxxxxxxxxxxxxxxxxxx",
+        },
+    )
+    assert bad.status_code == 400
+
+    # Failed PKCE must not consume the code — correct verifier still works.
+    ok = client.post(
+        "/oauth/token",
+        json={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": verifier,
+        },
+    )
+    assert ok.status_code == 200
+    assert ok.json()["access_token"]
+
+
+def test_oauth_pkce_required_rejects_missing_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ZENITH_OIDC_PKCE_REQUIRED", "true")
+    get_settings.cache_clear()
+    from api.main import create_app
+
+    with TestClient(create_app()) as c:
+        resp = c.get(
+            "/oauth/authorize",
+            params={"response_type": "code", "client_id": "demo"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["code"] == "invalid_request"
+    get_settings.cache_clear()
+
+
+def test_portal_rbac_operator_vs_admin(client: TestClient) -> None:
+    """keys:read lists; admin:keys mutates; rotate needs admin."""
+    op = {"X-API-Key": "zenith_operator_key_read"}
+    listed = client.get("/api/v1/admin/keys", headers=op)
+    assert listed.status_code == 200
+
+    denied = client.post(
+        "/api/v1/admin/keys",
+        headers=op,
+        json={"key_id": "nope", "scopes": ["layers:read"]},
+    )
+    assert denied.status_code == 403
+
+    admin = {"X-API-Key": "zenith_admin_key_manage"}
+    created = client.post(
+        "/api/v1/admin/keys",
+        headers=admin,
+        json={"key_id": "rot-me", "scopes": ["layers:read"], "label": "r"},
+    )
+    assert created.status_code == 201
+    old_secret = created.json()["secret"]
+
+    rotate_denied = client.post("/api/v1/admin/keys/rot-me/rotate", headers=op)
+    assert rotate_denied.status_code == 403
+
+    rotated = client.post("/api/v1/admin/keys/rot-me/rotate", headers=admin)
+    assert rotated.status_code == 200
+    new_secret = rotated.json()["secret"]
+    assert new_secret != old_secret
+    assert client.get("/api/v1/layers", headers={"X-API-Key": old_secret}).status_code == 401
+    assert client.get("/api/v1/layers", headers={"X-API-Key": new_secret}).status_code == 200
+
+
+def test_portal_login_sets_session_cookie(client: TestClient) -> None:
+    """PKCE portal login → cookie → session + admin list without X-API-Key."""
+    cfg = client.get("/oauth/oidc-config")
+    assert cfg.status_code == 200
+    assert cfg.json()["pkce"]["methods"] == ["S256"]
+    assert "portal_login" in cfg.json()
+
+    # follow_redirects: login → callback → key-portal; cookie jar keeps session.
+    landed = client.get(
+        "/oauth/portal/login",
+        params={"client_id": "admin", "return_to": "/admin/key-portal"},
+        follow_redirects=True,
+    )
+    assert landed.status_code in {200, 307}
+    assert client.cookies.get("zenith_portal_token")
+
+    session = client.get("/oauth/portal/session")
+    assert session.status_code == 200
+    body = session.json()
+    assert body["authenticated"] is True
+    assert body["key_id"] == "admin"
+    assert body["can_manage_keys"] is True
+    assert body["auth_via"] == "portal_cookie"
+
+    listed = client.get("/api/v1/admin/keys")
+    assert listed.status_code == 200
+
+    logout = client.post("/oauth/portal/logout")
+    assert logout.status_code == 200
+    assert client.get("/oauth/portal/session").status_code == 401
+
+
+def test_oauth_authorize_idp_includes_pkce(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from api.pkce import code_challenge_s256, generate_code_verifier
+
+    monkeypatch.setenv("ZENITH_OIDC_CLIENT_ID", "zenith-app")
+    monkeypatch.setenv(
+        "ZENITH_OIDC_AUTHORIZE_URL", "https://idp.example/authorize"
+    )
+    monkeypatch.setenv(
+        "ZENITH_OIDC_REDIRECT_URI", "http://127.0.0.1:8000/oauth/callback"
+    )
+    get_settings.cache_clear()
+    from api.main import create_app
+
+    verifier = generate_code_verifier()
+    challenge = code_challenge_s256(verifier)
+    with TestClient(create_app()) as oidc_client:
+        resp = oidc_client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "state": "xyz",
+                "scope": "openid",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302
+        loc = resp.headers["location"]
+        assert "code_challenge=" in loc
+        assert "code_challenge_method=S256" in loc
+    get_settings.cache_clear()

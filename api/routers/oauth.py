@@ -3,18 +3,23 @@
 Supports:
 - ``client_credentials`` (opaque local stub)
 - ``authorization_code`` / ``refresh_token`` (IdP proxy when configured, else local stub)
+- PKCE S256 on the auth-code flow (required when challenge supplied / when configured)
 - ``GET /oauth/authorize`` and ``GET /oauth/callback`` for the auth-code redirect flow
+- Portal session helpers: ``/oauth/portal/login|callback|logout|session``
+  (HttpOnly cookie so the key portal need not paste an admin key)
 """
 
 from __future__ import annotations
 
+import secrets
 from typing import Any, Optional
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
+from api.auth import Principal, require_api_key
 from api.config import Settings, get_settings
 from api.errors import REQUEST_ID_HEADER, ApiError, get_request_id
 from api.oauth import (
@@ -30,8 +35,12 @@ from api.oidc_flow import (
     oidc_client_configured,
     refresh_with_idp,
 )
+from api.pkce import code_challenge_s256, generate_code_verifier
 
 router = APIRouter(tags=["oauth"])
+
+PORTAL_CALLBACK_PATH = "/oauth/portal/callback"
+PORTAL_DEFAULT_RETURN = "/admin/key-portal"
 
 
 class TokenJsonRequest(BaseModel):
@@ -48,6 +57,10 @@ class TokenJsonRequest(BaseModel):
     code: Optional[str] = None
     redirect_uri: Optional[str] = None
     refresh_token: Optional[str] = None
+    code_verifier: Optional[str] = Field(
+        default=None,
+        description="PKCE code_verifier (required when authorize used S256 challenge)",
+    )
 
 
 class TokenResponse(BaseModel):
@@ -106,11 +119,15 @@ def _issue_authorization_code(
     *,
     code: str,
     redirect_uri: str | None,
+    code_verifier: str | None,
     settings: Settings,
 ) -> dict[str, Any]:
     if oidc_client_configured(settings):
         body = exchange_code_with_idp(
-            settings, code=code, redirect_uri=redirect_uri
+            settings,
+            code=code,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
         )
         if "error" in body or body.get("_http_status"):
             status = int(body.pop("_http_status", 401))
@@ -138,6 +155,7 @@ def _issue_authorization_code(
     pair = exchange_stub_authorization_code(
         code,
         redirect_uri=redirect_uri,
+        code_verifier=code_verifier,
         expires_in_s=settings.oauth_token_ttl_s,
         refresh_expires_in_s=settings.oauth_refresh_ttl_s,
     )
@@ -145,7 +163,7 @@ def _issue_authorization_code(
         raise ApiError(
             status_code=400,
             code="invalid_grant",
-            message="Invalid or expired authorization code",
+            message="Invalid or expired authorization code (or PKCE mismatch)",
         )
     return _token_json(
         access_token=pair.access.token,
@@ -213,6 +231,7 @@ def _issue(
     code: str | None,
     redirect_uri: str | None,
     refresh_token: str | None,
+    code_verifier: str | None,
     settings: Settings,
 ) -> dict[str, Any]:
     if not settings.oauth_enabled:
@@ -243,7 +262,10 @@ def _issue(
                 message="code is required for authorization_code",
             )
         return _issue_authorization_code(
-            code=code, redirect_uri=redirect_uri, settings=settings
+            code=code,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+            settings=settings,
         )
     if gt == "refresh_token":
         if not refresh_token:
@@ -261,6 +283,50 @@ def _issue(
             "authorization_code, refresh_token"
         ),
     )
+
+
+def _normalize_pkce(
+    *,
+    code_challenge: str | None,
+    code_challenge_method: str | None,
+    required: bool,
+) -> tuple[str, str]:
+    challenge = (code_challenge or "").strip()
+    method = (code_challenge_method or "").strip().upper() or "S256"
+    if required and not challenge:
+        raise ApiError(
+            status_code=400,
+            code="invalid_request",
+            message="PKCE required: provide code_challenge with method S256",
+        )
+    if challenge and method != "S256":
+        raise ApiError(
+            status_code=400,
+            code="invalid_request",
+            message="Only code_challenge_method=S256 is supported",
+        )
+    if not challenge:
+        return "", ""
+    return challenge, "S256"
+
+
+def _set_portal_cookie(
+    response: Response, settings: Settings, access_token: str, *, max_age: int
+) -> None:
+    response.set_cookie(
+        key=settings.portal_cookie_name,
+        value=access_token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+        max_age=max(60, max_age),
+    )
+
+
+def _clear_portal_cookies(response: Response, settings: Settings) -> None:
+    response.delete_cookie(settings.portal_cookie_name, path="/")
+    response.delete_cookie(settings.portal_pkce_cookie_name, path="/")
 
 
 @router.post(
@@ -288,6 +354,7 @@ async def token_endpoint(
             code=payload.code,
             redirect_uri=payload.redirect_uri,
             refresh_token=payload.refresh_token,
+            code_verifier=payload.code_verifier,
             settings=settings,
         )
     else:
@@ -305,6 +372,9 @@ async def token_endpoint(
             ),
             refresh_token=(
                 str(form["refresh_token"]) if form.get("refresh_token") else None
+            ),
+            code_verifier=(
+                str(form["code_verifier"]) if form.get("code_verifier") else None
             ),
             settings=settings,
         )
@@ -331,6 +401,8 @@ async def authorize_endpoint(
     redirect_uri: Optional[str] = Query(default=None),
     scope: Optional[str] = Query(default=None),
     state: Optional[str] = Query(default=None),
+    code_challenge: Optional[str] = Query(default=None),
+    code_challenge_method: Optional[str] = Query(default="S256"),
     settings: Settings = Depends(get_settings),
 ):
     if not settings.oauth_enabled:
@@ -346,6 +418,12 @@ async def authorize_endpoint(
             message="Only response_type=code is supported",
         )
 
+    challenge, method = _normalize_pkce(
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        required=settings.oidc_pkce_required,
+    )
+
     # External IdP path.
     if oidc_authorize_configured(settings):
         target = build_authorize_redirect_url(
@@ -353,6 +431,8 @@ async def authorize_endpoint(
             state=state,
             scope=scope,
             redirect_uri=redirect_uri or settings.oidc_redirect_uri,
+            code_challenge=challenge or None,
+            code_challenge_method=method or "S256",
         )
         return RedirectResponse(url=target, status_code=302)
 
@@ -361,6 +441,8 @@ async def authorize_endpoint(
         client_id,
         redirect_uri=redirect_uri or settings.oidc_redirect_uri,
         requested_scope=scope,
+        code_challenge=challenge,
+        code_challenge_method=method,
     )
     if auth is None:
         raise ApiError(
@@ -384,12 +466,16 @@ async def authorize_endpoint(
             "message": (
                 "No ZENITH_OIDC_AUTHORIZE_URL configured; issued a one-time "
                 "stub authorization code. Exchange via POST /oauth/token "
-                "grant_type=authorization_code. Set IdP env vars for real OIDC."
+                "grant_type=authorization_code"
+                + (" with code_verifier (PKCE S256)." if challenge else ".")
+                + " Set IdP env vars for real OIDC."
             ),
             "code": auth.code,
             "client_id": client_id,
             "expires_in": 300,
             "state": state,
+            "pkce": bool(challenge),
+            "code_challenge_method": method or None,
             "hint_env": [
                 "ZENITH_OIDC_AUTHORIZE_URL",
                 "ZENITH_OIDC_TOKEN_URL",
@@ -397,6 +483,7 @@ async def authorize_endpoint(
                 "ZENITH_OIDC_CLIENT_SECRET",
                 "ZENITH_OIDC_REDIRECT_URI",
                 "ZENITH_OIDC_JWKS_URL",
+                "ZENITH_OIDC_PKCE_REQUIRED",
             ],
             "request_id": get_request_id(request),
         },
@@ -414,6 +501,7 @@ async def callback_endpoint(
     state: Optional[str] = Query(default=None),
     error: Optional[str] = Query(default=None),
     error_description: Optional[str] = Query(default=None),
+    code_verifier: Optional[str] = Query(default=None),
     settings: Settings = Depends(get_settings),
 ) -> JSONResponse:
     if error:
@@ -435,9 +523,13 @@ async def callback_endpoint(
             message="OAuth is disabled",
         )
 
+    verifier = (code_verifier or "").strip() or request.cookies.get(
+        settings.portal_pkce_cookie_name, ""
+    )
     result = _issue_authorization_code(
         code=code,
         redirect_uri=settings.oidc_redirect_uri,
+        code_verifier=verifier or None,
         settings=settings,
     )
     return JSONResponse(
@@ -445,6 +537,205 @@ async def callback_endpoint(
             **result,
             "state": state,
             "mode": "idp" if oidc_client_configured(settings) else "local_stub",
+            "request_id": get_request_id(request),
+        },
+        headers={REQUEST_ID_HEADER: get_request_id(request)},
+    )
+
+
+@router.get(
+    "/oauth/portal/login",
+    summary="Start portal login (PKCE S256 → IdP or local stub)",
+)
+async def portal_login(
+    request: Request,
+    client_id: str = Query(
+        default="admin",
+        description="Local-stub only: API key_id to mint a code for (ignored with IdP)",
+    ),
+    scope: Optional[str] = Query(default=None),
+    return_to: str = Query(default=PORTAL_DEFAULT_RETURN),
+    settings: Settings = Depends(get_settings),
+):
+    """Bootstrap browser SSO for the key portal.
+
+    Sets a short-lived HttpOnly PKCE verifier cookie, then redirects to
+    ``/oauth/authorize`` (IdP or local stub). The portal callback exchanges
+    the code and sets ``zenith_portal_token`` so subsequent admin API calls
+    need no pasted key.
+    """
+    if not settings.oauth_enabled:
+        raise ApiError(
+            status_code=503,
+            code="service_unavailable",
+            message="OAuth is disabled",
+        )
+
+    verifier = generate_code_verifier()
+    challenge = code_challenge_s256(verifier)
+    state = secrets.token_urlsafe(16)
+    # Encode return_to in state lightly: state|return_to (return_to must be path).
+    safe_return = return_to if return_to.startswith("/") else PORTAL_DEFAULT_RETURN
+    state_payload = f"{state}|{safe_return}"
+
+    # Absolute redirect for real IdPs; relative path for local stub (TestClient-friendly).
+    if oidc_authorize_configured(settings):
+        portal_redirect = (
+            f"{settings.public_base_url.rstrip('/')}{PORTAL_CALLBACK_PATH}"
+        )
+    else:
+        portal_redirect = PORTAL_CALLBACK_PATH
+    effective_scope = scope or settings.oidc_scopes or "openid layers:read keys:read"
+
+    if oidc_authorize_configured(settings):
+        target = build_authorize_redirect_url(
+            settings,
+            state=state_payload,
+            scope=effective_scope,
+            redirect_uri=portal_redirect,
+            code_challenge=challenge,
+            code_challenge_method="S256",
+        )
+    else:
+        # Local stub authorize with PKCE; redirect_uri = portal callback.
+        auth = issue_stub_authorization_code(
+            client_id,
+            redirect_uri=portal_redirect,
+            requested_scope=None,
+            code_challenge=challenge,
+            code_challenge_method="S256",
+        )
+        if auth is None:
+            raise ApiError(
+                status_code=400,
+                code="invalid_client",
+                message=(
+                    "Unknown client_id for local portal login "
+                    "(use admin or operator key_id)"
+                ),
+            )
+        params = {"code": auth.code, "state": state_payload}
+        target = f"{portal_redirect}?{urlencode(params)}"
+
+    response = RedirectResponse(url=target, status_code=302)
+    response.set_cookie(
+        key=settings.portal_pkce_cookie_name,
+        value=verifier,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+        max_age=600,
+    )
+    return response
+
+
+@router.get(
+    "/oauth/portal/callback",
+    summary="Portal OIDC/stub callback → set session cookie",
+)
+async def portal_callback(
+    request: Request,
+    code: Optional[str] = Query(default=None),
+    state: Optional[str] = Query(default=None),
+    error: Optional[str] = Query(default=None),
+    error_description: Optional[str] = Query(default=None),
+    settings: Settings = Depends(get_settings),
+):
+    if error:
+        raise ApiError(
+            status_code=400,
+            code=str(error),
+            message=error_description or "Authorization denied",
+        )
+    if not code:
+        raise ApiError(
+            status_code=400,
+            code="bad_request",
+            message="Missing authorization code",
+        )
+
+    verifier = (request.cookies.get(settings.portal_pkce_cookie_name) or "").strip()
+    if not verifier:
+        raise ApiError(
+            status_code=400,
+            code="invalid_grant",
+            message="Missing PKCE verifier cookie — restart /oauth/portal/login",
+        )
+
+    if oidc_client_configured(settings) or oidc_authorize_configured(settings):
+        portal_redirect = (
+            f"{settings.public_base_url.rstrip('/')}{PORTAL_CALLBACK_PATH}"
+        )
+    else:
+        portal_redirect = PORTAL_CALLBACK_PATH
+    result = _issue_authorization_code(
+        code=code,
+        redirect_uri=portal_redirect,
+        code_verifier=verifier,
+        settings=settings,
+    )
+
+    return_to = PORTAL_DEFAULT_RETURN
+    if state and "|" in state:
+        _, maybe = state.split("|", 1)
+        if maybe.startswith("/"):
+            return_to = maybe
+
+    response = RedirectResponse(url=return_to, status_code=302)
+    _set_portal_cookie(
+        response,
+        settings,
+        result["access_token"],
+        max_age=int(result.get("expires_in") or settings.oauth_token_ttl_s),
+    )
+    response.delete_cookie(settings.portal_pkce_cookie_name, path="/")
+    return response
+
+
+@router.post(
+    "/oauth/portal/logout",
+    summary="Clear portal session cookie",
+)
+@router.get(
+    "/oauth/portal/logout",
+    summary="Clear portal session cookie",
+)
+async def portal_logout(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> JSONResponse:
+    response = JSONResponse(
+        {
+            "ok": True,
+            "message": "Portal session cleared",
+            "request_id": get_request_id(request),
+        },
+        headers={REQUEST_ID_HEADER: get_request_id(request)},
+    )
+    _clear_portal_cookies(response, settings)
+    return response
+
+
+@router.get(
+    "/oauth/portal/session",
+    summary="Current portal / API principal (cookie, Bearer, or API key)",
+)
+async def portal_session(
+    request: Request,
+    principal: Principal = Depends(require_api_key),
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "authenticated": True,
+            "key_id": principal.key_id,
+            "scopes": sorted(principal.scopes),
+            "label": principal.label,
+            "auth_via": principal.auth_via,
+            "can_list_keys": bool(
+                {"keys:read", "admin:keys"} & set(principal.scopes)
+            ),
+            "can_manage_keys": "admin:keys" in principal.scopes,
             "request_id": get_request_id(request),
         },
         headers={REQUEST_ID_HEADER: get_request_id(request)},
@@ -467,9 +758,21 @@ async def oidc_config_endpoint(
                 "authorization_code",
                 "refresh_token",
             ],
+            "pkce": {
+                "methods": ["S256"],
+                "required": settings.oidc_pkce_required,
+                "note": (
+                    "S256 is always enforced when code_challenge was sent "
+                    "at authorize time"
+                ),
+            },
             "authorize": "/oauth/authorize",
             "token": "/oauth/token",
             "callback": "/oauth/callback",
+            "portal_login": "/oauth/portal/login",
+            "portal_callback": PORTAL_CALLBACK_PATH,
+            "portal_logout": "/oauth/portal/logout",
+            "portal_session": "/oauth/portal/session",
             "idp_authorize_configured": oidc_authorize_configured(settings),
             "idp_token_configured": oidc_client_configured(settings),
             "jwks_configured": bool(settings.oidc_jwks_url),
@@ -481,6 +784,10 @@ async def oidc_config_endpoint(
             "jwks_url": settings.oidc_jwks_url or None,
             "authorize_url": settings.oidc_authorize_url or None,
             "token_url": settings.oidc_token_url or None,
+            "rbac_scopes": {
+                "operator_list": "keys:read",
+                "admin_manage": "admin:keys",
+            },
             "mode": (
                 "idp"
                 if oidc_client_configured(settings)

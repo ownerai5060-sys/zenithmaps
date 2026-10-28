@@ -1,4 +1,4 @@
-"""Streamlit operator page: create / list / revoke API keys via admin API."""
+"""Streamlit operator page: list / create / revoke / rotate API keys."""
 
 from __future__ import annotations
 
@@ -11,23 +11,28 @@ st.set_page_config(layout="wide", page_title="Zenith API Keys")
 st.title("API Key Portal")
 st.markdown(
     """
-Minimal operator UI for **create / list / revoke** against
-`/api/v1/admin/keys` (scope `admin:keys`).
-The same portal is also available as static HTML at
-`/admin/key-portal` when the API is running.
-Secrets are returned **once** on create — store them in a secret manager.
+Operator / admin UI for **list / create / revoke / rotate** against
+`/api/v1/admin/keys`.
+
+- Scope **`keys:read`** — list only (operator)
+- Scope **`admin:keys`** — create / revoke / rotate (admin)
+
+Prefer the static portal at `/admin/key-portal` with **Sign in (OIDC / stub)** —
+PKCE S256 sets an HttpOnly session cookie so you do not paste an admin key in
+the browser. This Streamlit page still uses an API key (cross-origin).
+Secrets are returned **once** on create/rotate.
 """
 )
 
 base_url = st.sidebar.text_input("API base URL", value="http://127.0.0.1:8000")
 admin_key = st.sidebar.text_input(
-    "Admin API key",
+    "API key (admin or operator)",
     value="zenith_admin_key_manage",
     type="password",
 )
 include_revoked = st.sidebar.checkbox("Include revoked", value=False)
 st.sidebar.caption(
-    "Demo admin key is for local/sandbox only. "
+    "Demo admin: `zenith_admin_key_manage` · operator: `zenith_operator_key_read`. "
     "Prefer `ZENITH_KEY_VAULT_PATH` so creates survive restart."
 )
 
@@ -75,13 +80,13 @@ if submitted:
             }
         )
     except ZenithApiError as exc:
-        st.error(f"Create failed: {exc}")
+        st.error(f"Create failed (need admin:keys): {exc}")
 
 st.subheader("Keys")
 try:
     listing = client.list_api_keys(include_revoked=include_revoked)
 except ZenithApiError as exc:
-    st.error(f"List failed (need admin:keys): {exc}")
+    st.error(f"List failed (need keys:read or admin:keys): {exc}")
     st.stop()
 
 items = listing.get("items") or []
@@ -90,13 +95,20 @@ if not items:
     st.info("No keys returned.")
 else:
     for item in items:
-        cols = st.columns([2, 3, 2, 1, 1])
+        cols = st.columns([2, 3, 2, 1, 1, 1])
         cols[0].markdown(f"`{item.get('key_id')}`")
         cols[1].write(", ".join(item.get("scopes") or []))
         cols[2].write(item.get("label") or "—")
         cols[3].write("revoked" if item.get("revoked") else "active")
         if not item.get("revoked"):
-            if cols[4].button("Revoke", key=f"revoke-{item.get('key_id')}"):
+            if cols[4].button("Rotate", key=f"rotate-{item.get('key_id')}"):
+                try:
+                    rotated = client.rotate_api_key(str(item.get("key_id")))
+                    st.warning("New secret (shown once):")
+                    st.code(rotated.get("secret", ""), language="text")
+                except ZenithApiError as exc:
+                    st.error(f"Rotate failed (need admin:keys): {exc}")
+            if cols[5].button("Revoke", key=f"revoke-{item.get('key_id')}"):
                 try:
                     client.revoke_api_key(str(item.get("key_id")))
                     st.rerun()

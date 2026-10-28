@@ -49,8 +49,10 @@ uvicorn api.main:app --reload --port 8000
 - PostGIS WFS-lite schema: `sql/001_zenith_features.sql` (optional; `psycopg` pinned)
 - Durable key vault: set `ZENITH_KEY_VAULT_PATH` (SQLite) so admin-created keys survive restart
 - Key portal UI: `/admin/key-portal` (static HTML) or Streamlit page `pages/8_🔑_API_Keys.py`
-- OAuth/OIDC: `/oauth/token` supports `client_credentials`, `authorization_code`, `refresh_token`;
-  `/oauth/authorize` + `/oauth/callback` stub locally or proxy to IdP via `ZENITH_OIDC_*`
+- Portal SSO (PKCE S256): `/oauth/portal/login` → HttpOnly cookie (no pasted admin key)
+- Light RBAC: `keys:read` (list) vs `admin:keys` (create/revoke/rotate); `POST .../keys/{id}/rotate`
+- OAuth/OIDC: `/oauth/token` supports `client_credentials`, `authorization_code`, `refresh_token`
+  with PKCE S256; `/oauth/authorize` + `/oauth/callback` stub locally or proxy to IdP via `ZENITH_OIDC_*`
 - Optional OIDC JWT Bearer: set `ZENITH_OIDC_JWKS_URL` (+ audience/issuer)
 
 Demo API keys are stubs for local/third-party onboarding only. Override with
@@ -96,7 +98,7 @@ streamlit run Home.py
 
 - `pages/6_📦_Web_Map_Service.py` — prefers API legends for catalog WMS layers
 - `pages/7_🗂️_API_Catalog.py` — thin client of `/api/v1`
-- `pages/8_🔑_API_Keys.py` — operator key portal (create / list / revoke)
+- `pages/8_🔑_API_Keys.py` — operator/admin key portal (list / create / revoke / rotate)
 
 Based on the [opengeos/streamlit-map-template](https://github.com/opengeos/streamlit-map-template).
 

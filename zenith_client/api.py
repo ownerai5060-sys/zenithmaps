@@ -123,7 +123,7 @@ class ZenithApiClient:
         return None
 
     def list_api_keys(self, *, include_revoked: bool = False) -> dict[str, Any]:
-        """List API keys (requires ``admin:keys``). Secrets are never returned."""
+        """List API keys (``keys:read`` or ``admin:keys``). Secrets omitted."""
         return self._request(
             "GET",
             "/api/v1/admin/keys",
@@ -149,3 +149,7 @@ class ZenithApiClient:
     def revoke_api_key(self, key_id: str) -> dict[str, Any]:
         """Revoke an API key (requires ``admin:keys``)."""
         return self._request("DELETE", f"/api/v1/admin/keys/{key_id}")
+
+    def rotate_api_key(self, key_id: str) -> dict[str, Any]:
+        """Rotate an API key secret (requires ``admin:keys``; secret once)."""
+        return self._request("POST", f"/api/v1/admin/keys/{key_id}/rotate")

@@ -1,4 +1,4 @@
-"""Zenith Maps Platform API entrypoint (M1–O3 + key portal / OIDC auth-code).
+"""Zenith Maps Platform API entrypoint (M1–O3 + K1–K2 + PKCE / portal RBAC).
 
 Architecture decision (M1)
 --------------------------
@@ -12,6 +12,7 @@ Run locally::
 
 Interactive OpenAPI docs: http://127.0.0.1:8000/docs
 Key portal (static): http://127.0.0.1:8000/admin/key-portal
+Portal SSO (PKCE): http://127.0.0.1:8000/oauth/portal/login
 """
 
 from __future__ import annotations
@@ -117,12 +118,14 @@ def create_app() -> FastAPI:
             "Stable HTTP API for Zenith Maps catalog, layer metadata, structured "
             "legends, allowlisted GetLegendGraphic, WFS-lite GeoJSON features "
             "(fixtures / optional PostGIS), allowlisted catalog tile URL "
-            "discovery, durable API-key vault, minimal key portal UI, catalog "
+            "discovery, durable API-key vault, key portal UI with light RBAC "
+            "(keys:read vs admin:keys) + PKCE S256 portal SSO cookie, catalog "
             "webhooks with durable subscription registry + delivery/retry log + "
             "HMAC stub, OAuth2 client_credentials + authorization_code/refresh "
-            "stubs (IdP proxy when configured), and optional OIDC JWT (JWKS) "
-            "Bearer validation. GraphQL is deferred. Streamlit pages in this "
-            "repo are a UI demo; external apps should integrate against `/api/v1`."
+            "with PKCE S256 (IdP proxy when configured), key rotation, and "
+            "optional OIDC JWT (JWKS) Bearer validation. GraphQL is deferred. "
+            "Streamlit pages in this repo are a UI demo; external apps should "
+            "integrate against `/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -205,6 +208,7 @@ def create_app() -> FastAPI:
                     "check_url": "/api/v1/security/check-url",
                     "allowlist": "/api/v1/security/allowlist",
                     "admin_keys": "/api/v1/admin/keys",
+                    "admin_key_rotate": "/api/v1/admin/keys/{key_id}/rotate",
                     "admin_webhooks": "/api/v1/admin/webhooks",
                     "admin_webhook_deliveries": "/api/v1/admin/webhooks/deliveries",
                     "admin_catalog": "/api/v1/admin/catalog",
@@ -212,6 +216,8 @@ def create_app() -> FastAPI:
                     "oauth_authorize": "/oauth/authorize",
                     "oauth_callback": "/oauth/callback",
                     "oauth_oidc_config": "/oauth/oidc-config",
+                    "oauth_portal_login": "/oauth/portal/login",
+                    "oauth_portal_session": "/oauth/portal/session",
                     "key_portal": "/admin/key-portal",
                     "healthz": "/healthz",
                     "metrics": "/metrics",
@@ -225,6 +231,12 @@ def create_app() -> FastAPI:
                         "authorization_code",
                         "refresh_token",
                     ],
+                    "pkce": "S256",
+                    "portal_cookie": settings.portal_cookie_name,
+                    "rbac": {
+                        "operator_list": "keys:read",
+                        "admin_manage": "admin:keys",
+                    },
                     "oidc_jwt": bool(settings.oidc_jwks_url),
                     "oidc_auth_code": bool(settings.oidc_token_url),
                 },
