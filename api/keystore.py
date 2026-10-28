@@ -29,6 +29,7 @@ class StoredKey:
     scopes: frozenset[str]
     label: str = ""
     created_at: float = 0.0
+    rotated_at: float = 0.0
     revoked: bool = False
     revoked_at: float | None = None
 
@@ -71,11 +72,25 @@ class KeyStore:
                 scopes TEXT NOT NULL,
                 label TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
+                rotated_at REAL NOT NULL DEFAULT 0,
                 revoked INTEGER NOT NULL DEFAULT 0,
                 revoked_at REAL
             )
             """
         )
+        # Lightweight column migrate for vaults created before rotated_at.
+        cols = {
+            str(r[1])
+            for r in conn.execute("PRAGMA table_info(api_keys)").fetchall()
+        }
+        if "rotated_at" not in cols:
+            conn.execute(
+                "ALTER TABLE api_keys ADD COLUMN rotated_at REAL NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "UPDATE api_keys SET rotated_at = created_at "
+                "WHERE rotated_at IS NULL OR rotated_at = 0"
+            )
         conn.commit()
         return conn
 
@@ -83,17 +98,20 @@ class KeyStore:
         if not self._vault_path:
             return
         scopes = " ".join(sorted(stored.scopes))
+        rotated_at = stored.rotated_at or stored.created_at
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO api_keys
-                    (key_id, secret, scopes, label, created_at, revoked, revoked_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (key_id, secret, scopes, label, created_at, rotated_at,
+                     revoked, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(key_id) DO UPDATE SET
                     secret=excluded.secret,
                     scopes=excluded.scopes,
                     label=excluded.label,
                     created_at=excluded.created_at,
+                    rotated_at=excluded.rotated_at,
                     revoked=excluded.revoked,
                     revoked_at=excluded.revoked_at
                 """,
@@ -103,6 +121,7 @@ class KeyStore:
                     scopes,
                     stored.label,
                     stored.created_at,
+                    rotated_at,
                     1 if stored.revoked else 0,
                     stored.revoked_at,
                 ),
@@ -117,12 +136,18 @@ class KeyStore:
             rows = conn.execute("SELECT * FROM api_keys").fetchall()
         for row in rows:
             scopes = frozenset(s for s in str(row["scopes"]).split() if s)
+            created = float(row["created_at"] or 0.0)
+            try:
+                rotated = float(row["rotated_at"] or 0.0) or created
+            except (IndexError, KeyError):
+                rotated = created
             loaded[row["key_id"]] = StoredKey(
                 key_id=row["key_id"],
                 secret=row["secret"],
                 scopes=scopes,
                 label=row["label"] or "",
-                created_at=float(row["created_at"] or 0.0),
+                created_at=created,
+                rotated_at=rotated,
                 revoked=bool(row["revoked"]),
                 revoked_at=float(row["revoked_at"]) if row["revoked_at"] else None,
             )
@@ -156,6 +181,7 @@ class KeyStore:
                     scopes=frozenset(record.scopes),
                     label=record.label,
                     created_at=now,
+                    rotated_at=now,
                     revoked=False,
                 )
                 self._keys[record.key_id] = stored
@@ -210,12 +236,14 @@ class KeyStore:
             raise ValueError("At least one scope is required")
         new_id = key_id or f"key_{secrets.token_hex(4)}"
         new_secret = secret or f"zenith_{secrets.token_urlsafe(24)}"
+        now = time.time()
         stored = StoredKey(
             key_id=new_id,
             secret=new_secret,
             scopes=scope_set,
             label=label,
-            created_at=time.time(),
+            created_at=now,
+            rotated_at=now,
             revoked=False,
         )
         with self._lock:
@@ -252,7 +280,7 @@ class KeyStore:
             stored = self._keys.get(key_id)
             if stored is None or stored.revoked:
                 return None
-            updated = replace(stored, secret=new_secret)
+            updated = replace(stored, secret=new_secret, rotated_at=time.time())
             self._keys[key_id] = updated
             self._persist_unlocked(updated)
             return updated

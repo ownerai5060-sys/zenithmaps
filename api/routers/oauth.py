@@ -6,8 +6,9 @@ Supports:
 - PKCE S256 on the auth-code flow (required when challenge supplied / when configured)
 - ``GET /oauth/authorize`` and ``GET /oauth/callback`` for the auth-code redirect flow
 - Local consent stub: ``GET/POST /oauth/consent`` (auth-code + redirect_uri)
-- Portal session helpers: ``/oauth/portal/login|callback|logout|session``
-  (HttpOnly cookie = opaque SSO session_id; IdP refresh kept server-side)
+- Portal session helpers: ``/oauth/portal/login|callback|logout|session|token-exchange``
+  (HttpOnly cookie = opaque SSO session_id; IdP refresh kept server-side;
+  token-exchange mints a short-lived Bearer for Streamlit / cross-origin clients)
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from api.consent import (
 )
 from api.csrf import new_csrf_token, portal_cookies_secure
 from api.errors import REQUEST_ID_HEADER, ApiError, get_request_id
+from api.keystore import get_keystore
 from api.oauth import (
     exchange_stub_authorization_code,
     get_token_store,
@@ -386,6 +388,11 @@ def _normalize_pkce(
     return challenge, "S256"
 
 
+def _cookie_domain(settings: Settings) -> str | None:
+    domain = (settings.portal_cookie_domain or "").strip()
+    return domain or None
+
+
 def _set_portal_cookie(
     response: Response, settings: Settings, session_id: str, *, max_age: int
 ) -> None:
@@ -395,29 +402,35 @@ def _set_portal_cookie(
     - Session: HttpOnly, SameSite=Lax, Path=/, Secure when public base is https
       (or ``ZENITH_PORTAL_COOKIE_SECURE=true``). Value is opaque ``session_id``
       resolved via the shared session store (Redis / SQLite / memory).
+    - Optional ``ZENITH_PORTAL_COOKIE_DOMAIN`` (e.g. ``.example.com``) so a
+      sibling Streamlit host can receive the same cookie — see SSO bridge docs.
     - CSRF: NOT HttpOnly so portal JS can mirror it into ``X-CSRF-Token``.
     - IdP refresh tokens stay server-side in the session / refresh store.
     """
     secure = portal_cookies_secure(settings)
     age = max(60, max_age)
+    domain = _cookie_domain(settings)
+    common: dict = {
+        "httponly": True,
+        "samesite": "lax",
+        "secure": secure,
+        "path": "/",
+        "max_age": age,
+    }
+    if domain:
+        common["domain"] = domain
     response.set_cookie(
         key=settings.portal_cookie_name,
         value=session_id,
-        httponly=True,
-        samesite="lax",
-        secure=secure,
-        path="/",
-        max_age=age,
+        **common,
     )
     if settings.portal_csrf_enabled:
+        csrf_common = dict(common)
+        csrf_common["httponly"] = False
         response.set_cookie(
             key=settings.portal_csrf_cookie_name,
             value=new_csrf_token(),
-            httponly=False,
-            samesite="lax",
-            secure=secure,
-            path="/",
-            max_age=age,
+            **csrf_common,
         )
 
 
@@ -426,9 +439,15 @@ def _clear_portal_cookies(
 ) -> None:
     if session_id:
         get_session_store().delete_session(session_id)
-    response.delete_cookie(settings.portal_cookie_name, path="/")
-    response.delete_cookie(settings.portal_pkce_cookie_name, path="/")
-    response.delete_cookie(settings.portal_csrf_cookie_name, path="/")
+    domain = _cookie_domain(settings)
+    for name in (
+        settings.portal_cookie_name,
+        settings.portal_pkce_cookie_name,
+        settings.portal_csrf_cookie_name,
+    ):
+        if domain:
+            response.delete_cookie(name, path="/", domain=domain)
+        response.delete_cookie(name, path="/")
 
 
 @router.post(
@@ -985,6 +1004,89 @@ async def portal_session(
     )
 
 
+@router.post(
+    "/oauth/portal/token-exchange",
+    summary="Exchange portal SSO session for a short-lived opaque Bearer",
+)
+async def portal_token_exchange(
+    request: Request,
+    principal: Principal = Depends(require_api_key),
+    settings: Settings = Depends(get_settings),
+) -> JSONResponse:
+    """Mint an opaque access token from an authenticated portal session.
+
+    Intended for Streamlit / server-side clients that can forward the shared
+    domain cookie (or already hold a Bearer) but prefer ``Authorization``
+    without CSRF. Honest limits:
+
+    * Cross-origin Streamlit **cannot** read HttpOnly cookies from another
+      host — set ``ZENITH_PORTAL_COOKIE_DOMAIN`` + reverse-proxy same parent
+      domain, or paste an API key / use client_credentials.
+    * OIDC subject sessions (``oidc:…``) without a local vault key cannot mint
+      a local opaque token here; use the IdP access token already on the
+      session / Bearer path instead.
+    """
+    if not settings.oauth_enabled:
+        raise ApiError(
+            status_code=503,
+            code="service_unavailable",
+            message="OAuth is disabled",
+        )
+    if principal.key_id.startswith("oidc:"):
+        # Prefer existing session access token when present.
+        access = ""
+        if principal.session_id:
+            rec = get_session_store().get_session(principal.session_id)
+            if rec is not None:
+                access = (rec.access_token or rec.idp_access_token or "").strip()
+        if access:
+            return JSONResponse(
+                {
+                    "token_type": "Bearer",
+                    "access_token": access,
+                    "expires_in": settings.oauth_token_ttl_s,
+                    "scope": " ".join(sorted(principal.scopes)),
+                    "key_id": principal.key_id,
+                    "source": "session_access_token",
+                    "request_id": get_request_id(request),
+                },
+                headers={REQUEST_ID_HEADER: get_request_id(request)},
+            )
+        raise ApiError(
+            status_code=400,
+            code="invalid_request",
+            message=(
+                "OIDC portal session has no local vault key and no stored "
+                "access token to exchange"
+            ),
+        )
+
+    stored = get_keystore().get(principal.key_id)
+    if stored is None or stored.revoked:
+        raise ApiError(
+            status_code=401,
+            code="unauthorized",
+            message="Portal principal key is missing or revoked",
+        )
+    pair = get_token_store().issue(
+        stored,
+        expires_in_s=settings.oauth_token_ttl_s,
+        scopes=principal.scopes,
+    )
+    return JSONResponse(
+        {
+            "token_type": "Bearer",
+            "access_token": pair.access.token,
+            "expires_in": pair.expires_in_s,
+            "scope": " ".join(sorted(principal.scopes)),
+            "key_id": principal.key_id,
+            "source": "opaque_token_store",
+            "request_id": get_request_id(request),
+        },
+        headers={REQUEST_ID_HEADER: get_request_id(request)},
+    )
+
+
 @router.get(
     "/oauth/oidc-config",
     summary="Effective OIDC / OAuth client configuration (no secrets)",
@@ -1017,6 +1119,7 @@ async def oidc_config_endpoint(
             "portal_callback": PORTAL_CALLBACK_PATH,
             "portal_logout": "/oauth/portal/logout",
             "portal_session": "/oauth/portal/session",
+            "portal_token_exchange": "/oauth/portal/token-exchange",
             "idp_authorize_configured": oidc_authorize_configured(settings),
             "idp_token_configured": oidc_client_configured(settings),
             "jwks_configured": bool(settings.oidc_jwks_url),
@@ -1039,12 +1142,15 @@ async def oidc_config_endpoint(
                 "csrf_enabled": settings.portal_csrf_enabled,
                 "secure": portal_cookies_secure(settings),
                 "samesite": "lax",
+                "domain": settings.portal_cookie_domain or None,
                 "value": "opaque_session_id",
                 "notes": (
                     "Session cookie holds opaque SSO session_id (HttpOnly); "
                     "CSRF is double-submit (readable cookie + X-CSRF-Token). "
                     "Secure follows ZENITH_PORTAL_COOKIE_SECURE or https "
-                    "public base URL. IdP refresh tokens are server-side only."
+                    "public base URL. Optional ZENITH_PORTAL_COOKIE_DOMAIN "
+                    "shares the cookie with sibling hosts (Streamlit SSO "
+                    "bridge). IdP refresh tokens are server-side only."
                 ),
             },
             "session_store": {

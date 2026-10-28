@@ -19,9 +19,10 @@ for external applications.
 (عمداً به تعویق افتاده). کاشی‌ها فقط URLهای allowlist‌شدهٔ کاتالوگ هستند؛
 سیاست CDN: `docs/tile-cdn-policy.md` و env اختیاری `ZENITH_TILE_CDN_BASE_URLS`.
 
-**وضعیت آمادگی API:** `staging-ready` (package `0.10.0` — sandbox / پروتوتایپ خارجی).
-SSO session مشترک (Redis/SQLite)، persistence رفرش IdP، و consent محلی stub آمده‌اند؛
-موارد فقط‑پروداکشن باقی‌مانده: IdP واقعی، SLA، CDN عملیاتی، worker مدیریت‌شده.
+**وضعیت آمادگی API:** `staging-ready` (package `0.11.0` — sandbox / پروتوتایپ خارجی).
+چرخش کلید مبتنی بر سیاست (cron CLI + endpoint ادمین)، پل SSO استریم‌لیت (محدودیت
+دامنهٔ کوکی صادقانه)، Redis/OTel پین‌شده در extras، و runbook عملیات در docs
+پروژه. موارد فقط‑پروداکشن باقی‌مانده: IdP واقعی، SLA، CDN عملیاتی، queue مدیریت‌شده.
 
 ---
 
@@ -56,6 +57,9 @@ uvicorn api.main:app --reload --port 8000
 - Key portal UI: `/admin/key-portal` (static HTML) or Streamlit page `pages/8_🔑_API_Keys.py`
 - Portal SSO (PKCE S256): `/oauth/portal/login` → HttpOnly session + CSRF double-submit cookie
 - Light RBAC: `keys:read` (list) vs `admin:keys` (create/revoke/rotate); `POST .../keys/{id}/rotate`
+- Policy rotation: `GET/PUT /api/v1/admin/keys/rotation-policy` + cron `python -m api.rotation_worker`
+- Streamlit SSO bridge: shared `ZENITH_PORTAL_COOKIE_DOMAIN` + `/oauth/portal/token-exchange` (see `zenith_client/sso_bridge.py`)
+- Optional Redis/OTel: `pip install -r requirements-api-extras.txt`; sample `docs/otel-collector.env.sample`
 - Webhook egress: soft SSRF blocks + optional `ZENITH_WEBHOOK_ALLOWED_HOSTS`
 - Tile CDN policy stub: `ZENITH_TILE_CDN_BASE_URLS` (allowlist only; no hosted CDN)
 - OAuth/OIDC: `/oauth/token` supports `client_credentials`, `authorization_code`, `refresh_token`

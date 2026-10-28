@@ -59,6 +59,8 @@ from api.routers import (
     tiles,
     webhooks,
 )
+from api.rotation_policy import get_rotation_policy_store
+from api.rotation_scheduler import start_rotation_scheduler, stop_rotation_scheduler
 from api.session_store import configure_session_store, get_session_store
 from api.webhook_log import get_delivery_log
 from api.webhook_retry import get_retry_queue
@@ -111,8 +113,13 @@ async def lifespan(app: FastAPI):
     get_retry_queue().configure(settings.webhook_log_path)
     reset_catalog_version(1)
     reset_rate_limiter(settings)
+    get_rotation_policy_store().configure(settings.key_vault_path)
     setup_otel(app, settings)
-    yield
+    start_rotation_scheduler(settings)
+    try:
+        yield
+    finally:
+        stop_rotation_scheduler()
 
 
 def create_app() -> FastAPI:
@@ -130,10 +137,12 @@ def create_app() -> FastAPI:
             "local consent stub, catalog webhooks with durable subscription "
             "registry + delivery/retry log + HMAC stub, OAuth2 "
             "client_credentials + authorization_code/refresh with PKCE S256 "
-            "(IdP proxy when configured), key rotation, and optional OIDC JWT "
-            "(JWKS) Bearer validation. GraphQL is deferred. Streamlit pages in "
-            "this repo are a UI demo; external apps should integrate against "
-            "`/api/v1`."
+            "(IdP proxy when configured), manual + policy key rotation "
+            "(admin policy + cron CLI), Streamlit SSO bridge helpers "
+            "(shared cookie domain / portal token exchange; honest limits), "
+            "and optional OIDC JWT (JWKS) Bearer validation. GraphQL is "
+            "deferred. Streamlit pages in this repo are a UI demo; external "
+            "apps should integrate against `/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -145,7 +154,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=[
             "Authorization",
             "Content-Type",
@@ -218,6 +227,10 @@ def create_app() -> FastAPI:
                     "allowlist": "/api/v1/security/allowlist",
                     "admin_keys": "/api/v1/admin/keys",
                     "admin_key_rotate": "/api/v1/admin/keys/{key_id}/rotate",
+                    "admin_rotation_policy": "/api/v1/admin/keys/rotation-policy",
+                    "admin_rotation_policy_run": (
+                        "/api/v1/admin/keys/rotation-policy/run"
+                    ),
                     "admin_webhooks": "/api/v1/admin/webhooks",
                     "admin_webhook_deliveries": "/api/v1/admin/webhooks/deliveries",
                     "admin_catalog": "/api/v1/admin/catalog",
@@ -228,6 +241,7 @@ def create_app() -> FastAPI:
                     "oauth_oidc_config": "/oauth/oidc-config",
                     "oauth_portal_login": "/oauth/portal/login",
                     "oauth_portal_session": "/oauth/portal/session",
+                    "oauth_portal_token_exchange": "/oauth/portal/token-exchange",
                     "key_portal": "/admin/key-portal",
                     "healthz": "/healthz",
                     "metrics": "/metrics",

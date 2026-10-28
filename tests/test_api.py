@@ -60,6 +60,7 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
         "/oauth/portal/callback",
         "/oauth/portal/logout",
         "/oauth/portal/session",
+        "/oauth/portal/token-exchange",
         "/admin/key-portal",
         "/api/v1/layers",
         "/api/v1/layers/{layer_id}",
@@ -73,6 +74,8 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
         "/api/v1/admin/keys",
         "/api/v1/admin/keys/{key_id}",
         "/api/v1/admin/keys/{key_id}/rotate",
+        "/api/v1/admin/keys/rotation-policy",
+        "/api/v1/admin/keys/rotation-policy/run",
         "/api/v1/admin/webhooks",
         "/api/v1/admin/webhooks/deliveries",
         "/api/v1/admin/catalog",
@@ -731,7 +734,7 @@ def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
     assert "admin_webhook_deliveries" in body["endpoints"]
     assert body["webhook_registry_durable"] is True
     assert body["webhook_retry_enabled"] is True
-    assert body["package_version"] == "0.10.0"
+    assert body["package_version"] == "0.11.0"
 
 
 def test_webhook_registry_survives_reconfigure(
@@ -1484,3 +1487,99 @@ def test_oauth_authorize_idp_includes_pkce(
         assert "code_challenge=" in loc
         assert "code_challenge_method=S256" in loc
     get_settings.cache_clear()
+
+
+def test_rotation_policy_admin_and_worker(client: TestClient, admin_headers: dict) -> None:
+    """Policy CRUD + due rotation (force/dry-run) + CLI once."""
+    from api.keystore import get_keystore
+    from api.rotation_worker import run_once
+
+    created = client.post(
+        "/api/v1/admin/keys",
+        headers=admin_headers,
+        json={"key_id": "rot-pol", "scopes": ["layers:read"], "label": "policy"},
+    )
+    assert created.status_code == 201
+    old_secret = created.json()["secret"]
+
+    # Make the secret look old without waiting 90 days.
+    stored = get_keystore().get("rot-pol")
+    assert stored is not None
+    stored.rotated_at = 1.0  # epoch-ish
+    get_keystore()._persist_unlocked(stored)  # noqa: SLF001 — test hook
+
+    got = client.get("/api/v1/admin/keys/rotation-policy", headers=admin_headers)
+    assert got.status_code == 200
+    assert got.json()["enabled"] is False
+
+    put = client.put(
+        "/api/v1/admin/keys/rotation-policy",
+        headers=admin_headers,
+        json={
+            "enabled": True,
+            "max_age_days": 1,
+            "exclude_key_ids": ["demo", "readonly", "operator", "admin"],
+        },
+    )
+    assert put.status_code == 200
+    assert put.json()["enabled"] is True
+    assert put.json()["max_age_days"] == 1.0
+
+    dry = client.post(
+        "/api/v1/admin/keys/rotation-policy/run",
+        headers=admin_headers,
+        json={"dry_run": True},
+    )
+    assert dry.status_code == 200
+    body = dry.json()
+    assert body["dry_run"] is True
+    due = [r for r in body["results"] if r["key_id"] == "rot-pol"]
+    assert due and due[0]["status"] == "dry_run"
+
+    run = client.post(
+        "/api/v1/admin/keys/rotation-policy/run",
+        headers=admin_headers,
+        json={"dry_run": False, "include_secrets": True},
+    )
+    assert run.status_code == 200
+    rotated_rows = [
+        r for r in run.json()["results"] if r["key_id"] == "rot-pol" and r["status"] == "rotated"
+    ]
+    assert rotated_rows
+    assert rotated_rows[0]["secret"] != old_secret
+
+    # CLI path (once) should no longer rotate (fresh age).
+    summary = run_once(dry_run=False, force=False, include_secrets=False)
+    assert summary["policy"]["enabled"] is True
+    again = [r for r in summary["results"] if r["key_id"] == "rot-pol"]
+    assert again and again[0]["status"] == "skipped"
+
+
+def test_portal_token_exchange(client: TestClient) -> None:
+    """Portal cookie → opaque Bearer via /oauth/portal/token-exchange."""
+    landed = client.get(
+        "/oauth/portal/login",
+        params={"client_id": "admin", "return_to": "/admin/key-portal"},
+        follow_redirects=True,
+    )
+    assert landed.status_code in {200, 307}
+    assert client.cookies.get("zenith_portal_token")
+    csrf = client.cookies.get("zenith_portal_csrf")
+    headers = {"X-CSRF-Token": csrf} if csrf else {}
+    exchanged = client.post("/oauth/portal/token-exchange", headers=headers)
+    assert exchanged.status_code == 200, exchanged.text
+    token = exchanged.json()["access_token"]
+    assert token
+    me = client.get(
+        "/oauth/portal/session",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert me.status_code == 200
+    assert me.json()["key_id"] == "admin"
+    assert "admin:keys" in me.json()["scopes"]
+
+
+def test_package_version_011(client: TestClient) -> None:
+    root = client.get("/api/v1")
+    assert root.status_code == 200
+    assert root.json()["package_version"] == "0.11.0"

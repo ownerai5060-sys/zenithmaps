@@ -22,6 +22,7 @@ from api.metrics import get_metrics  # noqa: E402
 from api.oauth import get_token_store  # noqa: E402
 from api.oidc import get_jwks_cache  # noqa: E402
 from api.rate_limit import get_rate_limiter, reset_rate_limiter  # noqa: E402
+from api.rotation_policy import get_rotation_policy_store  # noqa: E402
 from api.session_store import reset_session_store  # noqa: E402
 from api.webhook_log import get_delivery_log  # noqa: E402
 from api.webhook_retry import get_retry_queue  # noqa: E402
@@ -62,6 +63,8 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     monkeypatch.setenv("ZENITH_SESSION_STORE_BACKEND", "sqlite")
     monkeypatch.setenv("ZENITH_SESSION_STORE_PATH", str(sess))
     monkeypatch.setenv("ZENITH_OAUTH_CONSENT_ENABLED", "true")
+    monkeypatch.setenv("ZENITH_ROTATION_SCHEDULER_ENABLED", "false")
+    monkeypatch.delenv("ZENITH_PORTAL_COOKIE_DOMAIN", raising=False)
     get_settings.cache_clear()
     reset_rate_limiter()
     get_rate_limiter().reset()
@@ -71,6 +74,8 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     get_consent_store().reset()
     reset_session_store()
     get_keystore().reset_and_seed()
+    get_rotation_policy_store().configure(str(vault))
+    get_rotation_policy_store().reset()
     get_delivery_log().configure(str(whlog))
     get_webhook_registry().configure(str(whlog))
     get_retry_queue().configure(str(whlog))
@@ -88,6 +93,7 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     get_consent_store().reset()
     reset_session_store()
     get_keystore().reset_and_seed()
+    get_rotation_policy_store().reset()
     get_webhook_registry().reset()
     get_retry_queue().reset()
     get_delivery_log().reset()

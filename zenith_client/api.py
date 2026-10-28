@@ -41,19 +41,36 @@ class ZenithApiClient:
         base_url: str | None = None,
         api_key: str | None = None,
         *,
+        bearer_token: str | None = None,
+        cookies: dict[str, str] | None = None,
+        csrf_token: str | None = None,
         timeout_s: float = 10.0,
     ) -> None:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
-        self.api_key = api_key or DEFAULT_API_KEY
+        self.api_key = api_key if api_key is not None else (
+            None if bearer_token or cookies else DEFAULT_API_KEY
+        )
+        self.bearer_token = bearer_token
+        self.cookies = dict(cookies) if cookies else None
+        self.csrf_token = csrf_token
         self.timeout_s = timeout_s
 
     def _headers(self) -> dict[str, str]:
-        return {"X-API-Key": self.api_key, "Accept": "application/json"}
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+        elif self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        return headers
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}{path}"
         try:
-            with httpx.Client(timeout=self.timeout_s) as client:
+            with httpx.Client(
+                timeout=self.timeout_s, cookies=self.cookies
+            ) as client:
                 response = client.request(
                     method, url, headers=self._headers(), **kwargs
                 )
@@ -153,3 +170,32 @@ class ZenithApiClient:
     def rotate_api_key(self, key_id: str) -> dict[str, Any]:
         """Rotate an API key secret (requires ``admin:keys``; secret once)."""
         return self._request("POST", f"/api/v1/admin/keys/{key_id}/rotate")
+
+    def get_rotation_policy(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/admin/keys/rotation-policy")
+
+    def put_rotation_policy(self, **fields: Any) -> dict[str, Any]:
+        return self._request(
+            "PUT", "/api/v1/admin/keys/rotation-policy", json=fields
+        )
+
+    def run_rotation_policy(
+        self,
+        *,
+        dry_run: bool = False,
+        force: bool = False,
+        include_secrets: bool = False,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/admin/keys/rotation-policy/run",
+            json={
+                "dry_run": dry_run,
+                "force": force,
+                "include_secrets": include_secrets,
+            },
+        )
+
+    def portal_token_exchange(self) -> dict[str, Any]:
+        """Exchange portal cookie / current auth for an opaque Bearer."""
+        return self._request("POST", "/oauth/portal/token-exchange")

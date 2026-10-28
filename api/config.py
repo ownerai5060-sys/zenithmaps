@@ -117,6 +117,10 @@ class Settings:
     portal_csrf_cookie_name: str = "zenith_portal_csrf"
     # auto | true | false — Secure flag for portal session/CSRF/PKCE cookies.
     portal_cookie_secure: str = "auto"
+    # Optional Domain attribute for portal cookies (e.g. ".example.com") so
+    # Streamlit + API on sibling hosts can share the SSO session cookie.
+    # Empty = host-only (default; safest for local demos).
+    portal_cookie_domain: str = ""
     # Enforce CSRF double-submit for portal-cookie mutating requests.
     portal_csrf_enabled: bool = True
     # Shared SSO session + IdP refresh store (cluster-friendly).
@@ -125,6 +129,9 @@ class Settings:
     session_store_path: str = ""
     # Local-stub auth-code with redirect_uri shows a consent HTML form first.
     oauth_consent_enabled: bool = True
+    # Optional in-process rotation ticker (prefer cron CLI in multi-replica).
+    rotation_scheduler_enabled: bool = False
+    rotation_scheduler_interval_s: float = 3600.0
     # Webhook durability + HMAC signing stub.
     # Same SQLite path holds subscriptions, delivery log, and retry queue.
     webhook_log_path: str = ""
@@ -333,12 +340,17 @@ def get_settings() -> Settings:
             os.getenv("ZENITH_PORTAL_COOKIE_SECURE", "auto").strip().lower()
             or "auto"
         ),
+        portal_cookie_domain=os.getenv("ZENITH_PORTAL_COOKIE_DOMAIN", "").strip(),
         portal_csrf_enabled=_bool("ZENITH_PORTAL_CSRF_ENABLED", True),
         session_store_backend=_session_backend(
             os.getenv("ZENITH_SESSION_STORE_BACKEND", "auto")
         ),
         session_store_path=os.getenv("ZENITH_SESSION_STORE_PATH", "").strip(),
         oauth_consent_enabled=_bool("ZENITH_OAUTH_CONSENT_ENABLED", True),
+        rotation_scheduler_enabled=_bool("ZENITH_ROTATION_SCHEDULER_ENABLED", False),
+        rotation_scheduler_interval_s=_float(
+            "ZENITH_ROTATION_SCHEDULER_INTERVAL_S", 3600.0
+        ),
         webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
         webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
         webhook_retry_enabled=_bool("ZENITH_WEBHOOK_RETRY_ENABLED", True),
