@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import streamlit as st
 
-from zenith_client import ZenithApiClient, ZenithApiError
+from zenith_client import (
+    ZenithApiClient,
+    ZenithApiError,
+    resolve_streamlit_auth,
+    shared_cookie_domain_docs,
+)
 
 st.set_page_config(layout="wide", page_title="Zenith API Keys")
 
@@ -15,11 +20,12 @@ Operator / admin UI for **list / create / revoke / rotate** against
 `/api/v1/admin/keys`.
 
 - Scope **`keys:read`** — list only (operator)
-- Scope **`admin:keys`** — create / revoke / rotate (admin)
+- Scope **`admin:keys`** — create / revoke / rotate / rotation policy (admin)
 
 Prefer the static portal at `/admin/key-portal` with **Sign in (OIDC / stub)** —
-PKCE S256 sets an HttpOnly session cookie so you do not paste an admin key in
-the browser. This Streamlit page still uses an API key (cross-origin).
+PKCE S256 sets an HttpOnly session cookie. This Streamlit page can reuse that
+cookie **only** when API + Streamlit share a cookie domain (see sidebar).
+Otherwise paste an API key (cross-origin / Streamlit Cloud limit).
 Secrets are returned **once** on create/rotate.
 """
 )
@@ -30,13 +36,33 @@ admin_key = st.sidebar.text_input(
     value="zenith_admin_key_manage",
     type="password",
 )
+prefer_sso = st.sidebar.checkbox(
+    "Try portal SSO cookie / token-exchange first",
+    value=True,
+)
 include_revoked = st.sidebar.checkbox("Include revoked", value=False)
 st.sidebar.caption(
     "Demo admin: `zenith_admin_key_manage` · operator: `zenith_operator_key_read`. "
     "Prefer `ZENITH_KEY_VAULT_PATH` so creates survive restart."
 )
+st.sidebar.info(shared_cookie_domain_docs())
 
-client = ZenithApiClient(base_url=base_url, api_key=admin_key)
+auth = resolve_streamlit_auth(
+    base_url=base_url,
+    api_key=admin_key or None,
+    try_cookie_exchange=prefer_sso,
+)
+for note in auth.notes:
+    st.sidebar.caption(note)
+
+client = ZenithApiClient(
+    base_url=base_url,
+    api_key=auth.api_key,
+    bearer_token=auth.bearer_token,
+    cookies=auth.cookies,
+    csrf_token=auth.csrf_token,
+)
+st.caption(f"Auth source: **{auth.source}**")
 
 try:
     health = client.healthz(check_upstreams=False)
@@ -114,3 +140,34 @@ else:
                     st.rerun()
                 except ZenithApiError as exc:
                     st.error(f"Revoke failed: {exc}")
+
+st.subheader("Rotation policy")
+st.caption(
+    "Age-based rotation. Cron: `python -m api.rotation_worker`. "
+    "Demo seed keys are excluded by default."
+)
+try:
+    policy = client.get_rotation_policy()
+    st.json(policy)
+except ZenithApiError as exc:
+    st.warning(f"Could not load rotation policy: {exc}")
+else:
+    with st.form("rotation_policy"):
+        enabled = st.checkbox("enabled", value=bool(policy.get("enabled")))
+        max_age = st.number_input(
+            "max_age_days",
+            min_value=0.001,
+            value=float(policy.get("max_age_days") or 90),
+        )
+        dry = st.checkbox("dry_run when applying", value=True)
+        save = st.form_submit_button("Save policy")
+        run = st.form_submit_button("Save + run now")
+    if save or run:
+        try:
+            client.put_rotation_policy(enabled=enabled, max_age_days=max_age)
+            st.success("Policy saved")
+            if run:
+                report = client.run_rotation_policy(dry_run=dry, force=False)
+                st.json(report)
+        except ZenithApiError as exc:
+            st.error(f"Policy update failed: {exc}")
