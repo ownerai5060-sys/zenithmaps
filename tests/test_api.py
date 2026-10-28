@@ -731,7 +731,7 @@ def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
     assert "admin_webhook_deliveries" in body["endpoints"]
     assert body["webhook_registry_durable"] is True
     assert body["webhook_retry_enabled"] is True
-    assert body["package_version"] == "0.9.0"
+    assert body["package_version"] == "0.10.0"
 
 
 def test_webhook_registry_survives_reconfigure(
@@ -1009,48 +1009,62 @@ def test_oauth_auth_code_proxies_to_idp_token_url(
             assert token.status_code == 200
             body = token.json()
             assert body["access_token"] == "idp-access"
-            assert body["refresh_token"] == "idp-refresh"
+            # IdP refresh is persisted server-side; client gets opaque handle.
+            assert body["refresh_token"]
+            assert body["refresh_token"] != "idp-refresh"
 
             refresh = oidc_client.post(
                 "/oauth/token",
                 json={
                     "grant_type": "refresh_token",
-                    "refresh_token": "idp-refresh",
+                    "refresh_token": body["refresh_token"],
                 },
             )
             assert refresh.status_code == 200
             assert mock_http.post.call_count == 2
+            # Second call must send the real IdP refresh, not the opaque handle.
+            second_form = mock_http.post.call_args_list[1].kwargs.get("data") or {}
+            assert second_form.get("refresh_token") == "idp-refresh"
+            assert refresh.json()["refresh_token"] != "idp-refresh"
 
     get_settings.cache_clear()
 
 
-def test_oauth_callback_exchanges_stub_code(client: TestClient) -> None:
-    auth = client.get(
-        "/oauth/authorize",
-        params={
-            "response_type": "code",
-            "client_id": "demo",
-            "redirect_uri": "http://127.0.0.1:8000/oauth/callback",
-        },
-        follow_redirects=False,
-    )
-    assert auth.status_code == 302
-    loc = auth.headers["location"]
-    assert "code=" in loc
-    # Extract code from redirect query.
+def test_oauth_callback_exchanges_stub_code(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from urllib.parse import parse_qs, urlparse
 
-    qs = parse_qs(urlparse(loc).query)
-    code = qs["code"][0]
+    from api.config import get_settings
+    from api.main import create_app
 
-    # Callback uses settings redirect_uri; stub code was bound to same URI.
-    cb = client.get("/oauth/callback", params={"code": code, "state": "s1"})
-    assert cb.status_code == 200
-    body = cb.json()
-    assert body["access_token"]
-    assert body["refresh_token"]
-    assert body["mode"] == "local_stub"
-    assert body["state"] == "s1"
+    # Skip consent HTML for this redirect-bound authorize → callback path.
+    monkeypatch.setenv("ZENITH_OAUTH_CONSENT_ENABLED", "false")
+    get_settings.cache_clear()
+    with TestClient(create_app()) as c:
+        auth = c.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": "demo",
+                "redirect_uri": "http://127.0.0.1:8000/oauth/callback",
+            },
+            follow_redirects=False,
+        )
+        assert auth.status_code == 302
+        loc = auth.headers["location"]
+        assert "code=" in loc
+        qs = parse_qs(urlparse(loc).query)
+        code = qs["code"][0]
+
+        cb = c.get("/oauth/callback", params={"code": code, "state": "s1"})
+        assert cb.status_code == 200
+        body = cb.json()
+        assert body["access_token"]
+        assert body["refresh_token"]
+        assert body["mode"] == "local_stub"
+        assert body["state"] == "s1"
+    get_settings.cache_clear()
 
 
 def test_zenith_client_admin_key_helpers(client: TestClient) -> None:
@@ -1203,6 +1217,11 @@ def test_portal_login_sets_session_cookie(client: TestClient) -> None:
     assert body["key_id"] == "admin"
     assert body["can_manage_keys"] is True
     assert body["auth_via"] == "portal_cookie"
+    assert body["session_id"]
+    assert body["session_store"] in {"sqlite", "memory", "redis"}
+    assert body["session"]["key_id"] == "admin"
+    # Cookie holds opaque session_id, not the access token itself.
+    assert client.cookies.get("zenith_portal_token") == body["session_id"]
 
     listed = client.get("/api/v1/admin/keys")
     assert listed.status_code == 200
@@ -1293,6 +1312,142 @@ def test_migrate_lists_sql_and_exits_without_dsn(tmp_path) -> None:
     assert local == [("002", sample)]
 
     assert main(["--dry-run"]) == 2
+
+
+def test_oauth_local_consent_stub_approve_and_deny(
+    client: TestClient,
+) -> None:
+    """Local auth-code + redirect_uri parks on consent HTML before code."""
+    from urllib.parse import parse_qs, urlparse
+
+    auth = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "demo",
+            "redirect_uri": "http://127.0.0.1:8000/oauth/callback",
+            "state": "consent-state",
+            "scope": "layers:read",
+        },
+        follow_redirects=False,
+    )
+    assert auth.status_code == 200
+    assert "text/html" in auth.headers.get("content-type", "")
+    assert "Authorize application" in auth.text
+    assert 'name="pending_id"' in auth.text
+
+    # Pull pending_id from the HTML form.
+    import re
+
+    match = re.search(r'name="pending_id" value="([^"]+)"', auth.text)
+    assert match
+    pending_id = match.group(1)
+
+    denied = client.post(
+        "/oauth/consent",
+        data={"pending_id": pending_id, "decision": "deny"},
+        follow_redirects=False,
+    )
+    assert denied.status_code == 302
+    assert "error=access_denied" in denied.headers["location"]
+    assert "state=consent-state" in denied.headers["location"]
+
+    # Fresh consent → approve → code redirect.
+    auth2 = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "demo",
+            "redirect_uri": "http://127.0.0.1:8000/oauth/callback",
+            "state": "ok",
+        },
+        follow_redirects=False,
+    )
+    match2 = re.search(r'name="pending_id" value="([^"]+)"', auth2.text)
+    assert match2
+    approved = client.post(
+        "/oauth/consent",
+        data={"pending_id": match2.group(1), "decision": "approve"},
+        follow_redirects=False,
+    )
+    assert approved.status_code == 302
+    loc = approved.headers["location"]
+    qs = parse_qs(urlparse(loc).query)
+    assert qs["code"][0]
+    assert qs["state"][0] == "ok"
+
+    token = client.post(
+        "/oauth/token",
+        json={
+            "grant_type": "authorization_code",
+            "code": qs["code"][0],
+            "redirect_uri": "http://127.0.0.1:8000/oauth/callback",
+        },
+    )
+    assert token.status_code == 200
+    assert token.json()["access_token"]
+
+
+def test_session_store_sqlite_survives_reconfigure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """SQLite session + IdP refresh handles persist across worker re-attach."""
+    from api.config import get_settings
+    from api.session_store import (
+        SqliteSessionStore,
+        configure_session_store,
+        reset_session_store,
+    )
+
+    path = tmp_path / "sso.sqlite"
+    monkeypatch.setenv("ZENITH_SESSION_STORE_BACKEND", "sqlite")
+    monkeypatch.setenv("ZENITH_SESSION_STORE_PATH", str(path))
+    get_settings.cache_clear()
+    store = reset_session_store()
+    assert store.backend_name == "sqlite"
+
+    session = store.create_session(
+        key_id="admin",
+        scopes=frozenset({"admin:keys"}),
+        label="Admin",
+        ttl_s=600,
+        idp_refresh_token="secret-idp-refresh",
+    )
+    refresh = store.store_idp_refresh(
+        idp_refresh_token="idp-rt-1",
+        key_id="oidc:user",
+        scopes=frozenset({"openid"}),
+        label="u",
+        ttl_s=3600,
+    )
+    sid, handle = session.session_id, refresh.handle
+
+    # Re-attach without wipe (simulates another worker on the same file).
+    store2 = configure_session_store()
+    assert store2.backend_name == "sqlite"
+    loaded = store2.get_session(sid)
+    assert loaded is not None
+    assert loaded.key_id == "admin"
+    assert loaded.idp_refresh_token == "secret-idp-refresh"
+    rt = store2.get_idp_refresh(handle)
+    assert rt is not None
+    assert rt.idp_refresh_token == "idp-rt-1"
+
+    # Independent backend instance on the same path also sees rows.
+    peer = SqliteSessionStore(str(path))
+    assert peer.get_session(sid) is not None
+    get_settings.cache_clear()
+
+
+def test_oauth_oidc_config_exposes_session_and_consent(client: TestClient) -> None:
+    cfg = client.get("/oauth/oidc-config")
+    assert cfg.status_code == 200
+    body = cfg.json()
+    assert body["idp_refresh_persistence"] is True
+    assert body["consent"]["enabled"] is True
+    assert body["consent_path"] == "/oauth/consent"
+    assert body["session_store"]["backend"] in {"sqlite", "memory", "redis"}
+    assert body["portal_cookies"]["value"] == "opaque_session_id"
 
 
 def test_oauth_authorize_idp_includes_pkce(

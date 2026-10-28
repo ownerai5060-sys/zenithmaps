@@ -6,6 +6,7 @@ Clients may authenticate with:
 * ``Authorization: Bearer <opaque_token>`` — from ``POST /oauth/token`` stub
 * ``Authorization: Bearer <JWT>`` — when ``ZENITH_OIDC_JWKS_URL`` is set
   (validated against the IdP JWKS; see ``api.oidc``)
+* Portal HttpOnly cookie holding an opaque SSO ``session_id`` (session store)
 
 Demo keys live in ``api.config`` / the runtime ``KeyStore``. Opaque OAuth is a
 local stub; prefer an external OIDC IdP for production SLA.
@@ -25,6 +26,7 @@ from api.errors import ApiError
 from api.keystore import get_keystore
 from api.oauth import get_token_store
 from api.oidc import looks_like_jwt, validate_bearer_jwt
+from api.session_store import get_session_store
 
 API_KEY_HEADER_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
@@ -38,7 +40,8 @@ class Principal:
     key_id: str
     scopes: frozenset[str]
     label: str = ""
-    auth_via: str = "api_key"  # "api_key" | "bearer" | "oidc_jwt"
+    auth_via: str = "api_key"  # "api_key" | "bearer" | "oidc_jwt" | "portal_cookie"
+    session_id: str = ""
 
 
 def _principal_from_bearer_token(
@@ -67,6 +70,37 @@ def _principal_from_bearer_token(
         scopes=access.scopes,
         label=access.label,
         auth_via=auth_via,
+    )
+
+
+def _principal_from_portal_cookie(
+    cookie_value: str, settings: Settings
+) -> Principal | None:
+    """Resolve portal cookie: prefer SSO session_id, fall back to legacy bearer."""
+    session = get_session_store().get_session(cookie_value)
+    if session is not None:
+        # Prefer vault state when key_id is a local API key; keep OIDC subjects.
+        if not session.key_id.startswith("oidc:"):
+            stored = get_keystore().get(session.key_id)
+            if stored is None or stored.revoked:
+                get_session_store().delete_session(session.session_id)
+                return None
+            scopes = frozenset(session.scopes & stored.scopes) or stored.scopes
+            label = stored.label
+        else:
+            scopes = session.scopes
+            label = session.label
+        return Principal(
+            key_id=session.key_id,
+            scopes=scopes,
+            label=label,
+            auth_via="portal_cookie",
+            session_id=session.session_id,
+        )
+
+    # Legacy: cookie used to hold the opaque / IdP access token directly.
+    return _principal_from_bearer_token(
+        cookie_value, settings, auth_via="portal_cookie"
     )
 
 
@@ -110,9 +144,7 @@ async def require_api_key(
     cookie_name = settings.portal_cookie_name or "zenith_portal_token"
     cookie_token = (request.cookies.get(cookie_name) or "").strip()
     if cookie_token:
-        principal = _principal_from_bearer_token(
-            cookie_token, settings, auth_via="portal_cookie"
-        )
+        principal = _principal_from_portal_cookie(cookie_token, settings)
         if principal is None:
             raise ApiError(
                 status_code=401,

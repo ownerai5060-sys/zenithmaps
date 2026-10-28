@@ -44,6 +44,7 @@ from api.errors import (
 from api.catalog import reset_catalog_version
 from api.keystore import get_keystore
 from api.metrics import get_metrics
+from api.consent import get_consent_store
 from api.oauth import get_token_store
 from api.oidc import get_jwks_cache
 from api.otel import setup_otel
@@ -58,6 +59,7 @@ from api.routers import (
     tiles,
     webhooks,
 )
+from api.session_store import configure_session_store, get_session_store
 from api.webhook_log import get_delivery_log
 from api.webhook_retry import get_retry_queue
 from api.webhooks import get_webhook_registry
@@ -99,6 +101,10 @@ async def lifespan(app: FastAPI):
     get_keystore().reset_and_seed(settings.api_keys)
     get_token_store().reset()
     get_jwks_cache().reset()
+    get_consent_store().reset()
+    # Shared SSO session + IdP refresh (Redis / SQLite / memory).
+    configure_session_store(settings)
+    get_session_store().reset()
     # Shared SQLite: subscriptions + delivery log + retry queue.
     get_delivery_log().configure(settings.webhook_log_path)
     get_webhook_registry().configure(settings.webhook_log_path)
@@ -119,13 +125,15 @@ def create_app() -> FastAPI:
             "legends, allowlisted GetLegendGraphic, WFS-lite GeoJSON features "
             "(fixtures / optional PostGIS), allowlisted catalog tile URL "
             "discovery, durable API-key vault, key portal UI with light RBAC "
-            "(keys:read vs admin:keys) + PKCE S256 portal SSO cookie, catalog "
-            "webhooks with durable subscription registry + delivery/retry log + "
-            "HMAC stub, OAuth2 client_credentials + authorization_code/refresh "
-            "with PKCE S256 (IdP proxy when configured), key rotation, and "
-            "optional OIDC JWT (JWKS) Bearer validation. GraphQL is deferred. "
-            "Streamlit pages in this repo are a UI demo; external apps should "
-            "integrate against `/api/v1`."
+            "(keys:read vs admin:keys) + PKCE S256 portal SSO (shared session "
+            "store: Redis/SQLite/memory; IdP refresh persisted server-side), "
+            "local consent stub, catalog webhooks with durable subscription "
+            "registry + delivery/retry log + HMAC stub, OAuth2 "
+            "client_credentials + authorization_code/refresh with PKCE S256 "
+            "(IdP proxy when configured), key rotation, and optional OIDC JWT "
+            "(JWKS) Bearer validation. GraphQL is deferred. Streamlit pages in "
+            "this repo are a UI demo; external apps should integrate against "
+            "`/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -216,6 +224,7 @@ def create_app() -> FastAPI:
                     "oauth_token": "/oauth/token",
                     "oauth_authorize": "/oauth/authorize",
                     "oauth_callback": "/oauth/callback",
+                    "oauth_consent": "/oauth/consent",
                     "oauth_oidc_config": "/oauth/oidc-config",
                     "oauth_portal_login": "/oauth/portal/login",
                     "oauth_portal_session": "/oauth/portal/session",
@@ -234,8 +243,12 @@ def create_app() -> FastAPI:
                     ],
                     "pkce": "S256",
                     "portal_cookie": settings.portal_cookie_name,
+                    "portal_cookie_value": "opaque_session_id",
                     "portal_csrf_cookie": settings.portal_csrf_cookie_name,
                     "portal_csrf_header": "X-CSRF-Token",
+                    "session_store": get_session_store().backend_name,
+                    "idp_refresh_persistence": True,
+                    "local_consent": settings.oauth_consent_enabled,
                     "rbac": {
                         "operator_list": "keys:read",
                         "admin_manage": "admin:keys",
@@ -253,6 +266,8 @@ def create_app() -> FastAPI:
                 "webhook_log_durable": bool(settings.webhook_log_path),
                 "webhook_registry_durable": bool(settings.webhook_log_path),
                 "webhook_retry_enabled": bool(settings.webhook_retry_enabled),
+                "session_store_durable": get_session_store().backend_name
+                in {"sqlite", "redis"},
                 "readiness": "staging-ready",
                 "request_id": get_request_id(request),
             },

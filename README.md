@@ -19,8 +19,9 @@ for external applications.
 (عمداً به تعویق افتاده). کاشی‌ها فقط URLهای allowlist‌شدهٔ کاتالوگ هستند؛
 سیاست CDN: `docs/tile-cdn-policy.md` و env اختیاری `ZENITH_TILE_CDN_BASE_URLS`.
 
-**وضعیت آمادگی API:** `staging-ready` (sandbox / پروتوتایپ خارجی). موارد فقط‑پروداکشن
-در گزارش readiness باقی مانده‌اند (IdP واقعی، SLA، CDN عملیاتی، worker مدیریت‌شده).
+**وضعیت آمادگی API:** `staging-ready` (package `0.10.0` — sandbox / پروتوتایپ خارجی).
+SSO session مشترک (Redis/SQLite)، persistence رفرش IdP، و consent محلی stub آمده‌اند؛
+موارد فقط‑پروداکشن باقی‌مانده: IdP واقعی، SLA، CDN عملیاتی، worker مدیریت‌شده.
 
 ---
 

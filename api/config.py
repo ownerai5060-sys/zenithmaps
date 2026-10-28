@@ -25,6 +25,7 @@ class ApiKeyRecord:
 
 
 RateLimitBackendName = Literal["memory", "redis", "auto"]
+SessionStoreBackendName = Literal["memory", "sqlite", "redis", "auto"]
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class Settings:
     # When False, PKCE is still enforced whenever a challenge was supplied.
     oidc_pkce_required: bool = False
     # HttpOnly cookie used by the static key portal after OIDC / stub login.
+    # Cookie value is an opaque SSO session_id (looked up in session store).
     portal_cookie_name: str = "zenith_portal_token"
     portal_pkce_cookie_name: str = "zenith_pkce_verifier"
     # Non-HttpOnly double-submit CSRF cookie (readable by portal JS).
@@ -117,6 +119,12 @@ class Settings:
     portal_cookie_secure: str = "auto"
     # Enforce CSRF double-submit for portal-cookie mutating requests.
     portal_csrf_enabled: bool = True
+    # Shared SSO session + IdP refresh store (cluster-friendly).
+    session_store_backend: SessionStoreBackendName = "auto"
+    # SQLite/file path when backend is sqlite or auto (fallback).
+    session_store_path: str = ""
+    # Local-stub auth-code with redirect_uri shows a consent HTML form first.
+    oauth_consent_enabled: bool = True
     # Webhook durability + HMAC signing stub.
     # Same SQLite path holds subscriptions, delivery log, and retry queue.
     webhook_log_path: str = ""
@@ -205,6 +213,13 @@ def _float(name: str, default: float) -> float:
     if raw is None or raw.strip() == "":
         return default
     return float(raw)
+
+
+def _session_backend(raw: str | None) -> SessionStoreBackendName:
+    value = (raw or "auto").strip().lower()
+    if value not in {"memory", "sqlite", "redis", "auto"}:
+        return "auto"
+    return value  # type: ignore[return-value]
 
 
 @lru_cache(maxsize=1)
@@ -319,6 +334,11 @@ def get_settings() -> Settings:
             or "auto"
         ),
         portal_csrf_enabled=_bool("ZENITH_PORTAL_CSRF_ENABLED", True),
+        session_store_backend=_session_backend(
+            os.getenv("ZENITH_SESSION_STORE_BACKEND", "auto")
+        ),
+        session_store_path=os.getenv("ZENITH_SESSION_STORE_PATH", "").strip(),
+        oauth_consent_enabled=_bool("ZENITH_OAUTH_CONSENT_ENABLED", True),
         webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
         webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
         webhook_retry_enabled=_bool("ZENITH_WEBHOOK_RETRY_ENABLED", True),
