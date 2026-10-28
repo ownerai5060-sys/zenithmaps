@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from api.auth import Principal, require_scopes
+from api.auth import Principal
 from api.config import Settings, get_settings
 from api.models import UrlCheckRequest, UrlCheckResponse
+from api.rate_limit import require_rate_limited
 from api.security.allowlist import check_wms_url
 
 router = APIRouter(prefix="/security", tags=["security"])
@@ -23,7 +24,7 @@ router = APIRouter(prefix="/security", tags=["security"])
 )
 def check_url(
     body: UrlCheckRequest,
-    _principal: Principal = Depends(require_scopes("layers:read")),
+    _principal: Principal = Depends(require_rate_limited("layers:read")),
     settings: Settings = Depends(get_settings),
 ) -> UrlCheckResponse:
     return check_wms_url(body.url, body.layer_name, settings=settings)
@@ -34,7 +35,7 @@ def check_url(
     summary="Return configured WMS host/layer allowlist",
 )
 def get_allowlist(
-    _principal: Principal = Depends(require_scopes("layers:read")),
+    _principal: Principal = Depends(require_rate_limited("layers:read")),
     settings: Settings = Depends(get_settings),
 ) -> dict:
     return {

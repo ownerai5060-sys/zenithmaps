@@ -53,6 +53,14 @@ class Settings:
     api_keys: tuple[ApiKeyRecord, ...] = field(default_factory=tuple)
     # When True, reject any outbound/proxy pattern that is not allowlisted.
     enforce_wms_allowlist: bool = True
+    # Per-API-key fixed-window rate limit (S3).
+    rate_limit_enabled: bool = True
+    rate_limit_requests: int = 120
+    rate_limit_window_s: int = 60
+    # Health upstream probes (S2). Set false in unit tests / offline CI.
+    health_check_upstreams: bool = True
+    # Public base URL used in docs / legend graphic absolute links (optional).
+    public_base_url: str = "http://127.0.0.1:8000"
 
 
 def _parse_csv(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -122,11 +130,29 @@ def get_settings() -> Settings:
         os.getenv("ZENITH_WMS_ALLOWED_LAYERS"),
         ("WORLDCOVER_2020_MAP", "WORLDCOVER_2021_MAP"),
     )
+    def _bool(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.lower() not in {"0", "false", "no"}
+
+    def _int(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            return default
+        return int(raw)
+
     return Settings(
         cors_origins=cors,
         wms_allowed_hosts=frozenset(h.lower() for h in hosts),
         wms_allowed_layers=frozenset(layers),
         api_keys=keys,
-        enforce_wms_allowlist=os.getenv("ZENITH_ENFORCE_WMS_ALLOWLIST", "true").lower()
-        not in {"0", "false", "no"},
+        enforce_wms_allowlist=_bool("ZENITH_ENFORCE_WMS_ALLOWLIST", True),
+        rate_limit_enabled=_bool("ZENITH_RATE_LIMIT_ENABLED", True),
+        rate_limit_requests=_int("ZENITH_RATE_LIMIT_REQUESTS", 120),
+        rate_limit_window_s=_int("ZENITH_RATE_LIMIT_WINDOW_S", 60),
+        health_check_upstreams=_bool("ZENITH_HEALTH_CHECK_UPSTREAMS", True),
+        public_base_url=os.getenv("ZENITH_PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip(
+            "/"
+        ),
     )

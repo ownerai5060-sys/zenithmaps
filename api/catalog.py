@@ -143,7 +143,21 @@ def get_layer(layer_id: str) -> LayerDetail | None:
 def get_legend(layer_id: str) -> Legend | None:
     if layer_id not in _LAYERS:
         return None
-    return _LEGENDS.get(layer_id)
+    legend = _LEGENDS.get(layer_id)
+    if legend is None:
+        return None
+    # Enrich with GetLegendGraphic metadata when the layer has a WMS source (S1).
+    from api.legend_graphic import legend_graphic_url_for_layer
+
+    graphic = legend_graphic_url_for_layer(layer_id)
+    return legend.model_copy(
+        update={
+            "get_legend_graphic_url": graphic,
+            "legend_image_path": (
+                f"/api/v1/layers/{layer_id}/legend/image" if graphic else None
+            ),
+        }
+    )
 
 
 def known_layer_ids() -> frozenset[str]:
