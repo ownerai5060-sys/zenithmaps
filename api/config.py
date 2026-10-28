@@ -91,6 +91,14 @@ class Settings:
     oidc_audience: str = ""
     oidc_issuer: str = ""
     oidc_default_scopes: str = "layers:read"
+    # OIDC confidential-client / auth-code + refresh (external IdP or local stub).
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_authorize_url: str = ""
+    oidc_token_url: str = ""
+    oidc_redirect_uri: str = "http://127.0.0.1:8000/oauth/callback"
+    oidc_scopes: str = "openid layers:read"
+    oauth_refresh_ttl_s: int = 86400
     # Webhook durability + HMAC signing stub.
     # Same SQLite path holds subscriptions, delivery log, and retry queue.
     webhook_log_path: str = ""
@@ -243,6 +251,21 @@ def get_settings() -> Settings:
             os.getenv("ZENITH_OIDC_DEFAULT_SCOPES", "layers:read").strip()
             or "layers:read"
         ),
+        oidc_client_id=os.getenv("ZENITH_OIDC_CLIENT_ID", "").strip(),
+        oidc_client_secret=os.getenv("ZENITH_OIDC_CLIENT_SECRET", "").strip(),
+        oidc_authorize_url=os.getenv("ZENITH_OIDC_AUTHORIZE_URL", "").strip(),
+        oidc_token_url=os.getenv("ZENITH_OIDC_TOKEN_URL", "").strip(),
+        oidc_redirect_uri=(
+            os.getenv(
+                "ZENITH_OIDC_REDIRECT_URI", "http://127.0.0.1:8000/oauth/callback"
+            ).strip()
+            or "http://127.0.0.1:8000/oauth/callback"
+        ),
+        oidc_scopes=(
+            os.getenv("ZENITH_OIDC_SCOPES", "openid layers:read").strip()
+            or "openid layers:read"
+        ),
+        oauth_refresh_ttl_s=_int("ZENITH_OAUTH_REFRESH_TTL_S", 86400),
         webhook_log_path=os.getenv("ZENITH_WEBHOOK_LOG_PATH", "").strip(),
         webhook_signing_secret=os.getenv("ZENITH_WEBHOOK_SIGNING_SECRET", "").strip(),
         webhook_retry_enabled=_bool("ZENITH_WEBHOOK_RETRY_ENABLED", True),

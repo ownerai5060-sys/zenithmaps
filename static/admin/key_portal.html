@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Zenith API Key Portal</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #9aa8bc;
+      --accent: #3d9cf0;
+      --danger: #e85d5d;
+      --ok: #3ecf8e;
+      --border: #2a3748;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #1e3a5f 0%, transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, #163049 0%, transparent 50%),
+        var(--bg);
+    }
+    main {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 4rem;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.35rem;
+    }
+    .lede {
+      color: var(--muted);
+      margin: 0 0 1.75rem;
+      line-height: 1.45;
+      max-width: 42rem;
+    }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.1rem 1.15rem;
+      margin-bottom: 1rem;
+    }
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.3rem;
+    }
+    input, select {
+      width: 100%;
+      background: #0c1118;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 0.55rem 0.65rem;
+      font: inherit;
+      margin-bottom: 0.75rem;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+    @media (max-width: 640px) {
+      .row { grid-template-columns: 1fr; }
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.25rem;
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 0.55rem 0.9rem;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: #041018;
+    }
+    button.secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button.danger {
+      background: var(--danger);
+      color: #1a0505;
+    }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.55rem 0.4rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 560; font-size: 0.78rem; }
+    code, .mono { font-family: var(--mono); font-size: 0.85em; }
+    .msg {
+      margin-top: 0.75rem;
+      padding: 0.7rem 0.8rem;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      line-height: 1.4;
+      display: none;
+    }
+    .msg.show { display: block; }
+    .msg.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent); }
+    .msg.err { background: color-mix(in srgb, var(--danger) 18%, transparent); border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent); }
+    .secret-once {
+      margin-top: 0.75rem;
+      padding: 0.75rem;
+      border-radius: 6px;
+      border: 1px dashed color-mix(in srgb, var(--accent) 50%, transparent);
+      background: #0c1520;
+      display: none;
+    }
+    .secret-once.show { display: block; }
+    .hint { color: var(--muted); font-size: 0.82rem; margin: 0.35rem 0 0; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Zenith API Key Portal</h1>
+    <p class="lede">
+      Minimal operator UI for create / list / revoke against
+      <code>/api/v1/admin/keys</code>. Requires an admin key with scope
+      <code>admin:keys</code>. Secrets are shown <strong>once</strong> on create.
+      Prefer the durable vault (<code>ZENITH_KEY_VAULT_PATH</code>) in staging.
+    </p>
+
+    <section class="panel">
+      <div class="row">
+        <div>
+          <label for="baseUrl">API base URL</label>
+          <input id="baseUrl" value="" autocomplete="off" />
+        </div>
+        <div>
+          <label for="adminKey">Admin API key</label>
+          <input id="adminKey" type="password" value="zenith_admin_key_manage" autocomplete="off" />
+        </div>
+      </div>
+      <p class="hint">Demo admin secret is for local/sandbox only. Override in real deploys.</p>
+      <div class="actions">
+        <button type="button" id="btnConnect" class="secondary">Check connection</button>
+        <button type="button" id="btnRefresh">Refresh list</button>
+        <a href="/docs" target="_blank" rel="noopener">OpenAPI docs</a>
+      </div>
+      <div id="status" class="msg" role="status"></div>
+    </section>
+
+    <section class="panel">
+      <h2 style="margin:0 0 0.75rem;font-size:1.05rem;">Create key</h2>
+      <div class="row">
+        <div>
+          <label for="keyId">key_id (optional)</label>
+          <input id="keyId" placeholder="auto-generated if empty" />
+        </div>
+        <div>
+          <label for="label">label</label>
+          <input id="label" placeholder="Partner sandbox" />
+        </div>
+      </div>
+      <label for="scopes">scopes (comma-separated)</label>
+      <input id="scopes" value="layers:read" />
+      <div class="actions">
+        <button type="button" id="btnCreate">Create</button>
+      </div>
+      <div id="createdSecret" class="secret-once">
+        <strong>Store this secret now — it will not be shown again.</strong>
+        <pre class="mono" id="secretValue" style="margin:0.5rem 0 0;white-space:pre-wrap;word-break:break-all;"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 style="margin:0 0 0.75rem;font-size:1.05rem;">Keys</h2>
+      <label style="display:flex;align-items:center;gap:0.4rem;margin-bottom:0.75rem;">
+        <input id="includeRevoked" type="checkbox" style="width:auto;margin:0;" />
+        Include revoked
+      </label>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>key_id</th>
+              <th>scopes</th>
+              <th>label</th>
+              <th>status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="keyRows">
+            <tr><td colspan="5" class="hint">Connect and refresh to load keys.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function defaultBase() {
+      // Same origin when served from the API; otherwise localhost default.
+      if (location.port === "8000" || location.pathname.startsWith("/static/")) {
+        return location.origin;
+      }
+      return "http://127.0.0.1:8000";
+    }
+
+    $("baseUrl").value = defaultBase();
+
+    function showMsg(el, text, ok) {
+      el.textContent = text;
+      el.className = "msg show " + (ok ? "ok" : "err");
+    }
+
+    function headers() {
+      return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-API-Key": $("adminKey").value.trim(),
+      };
+    }
+
+    async function api(method, path, body) {
+      const base = $("baseUrl").value.replace(/\/$/, "");
+      const res = await fetch(base + path, {
+        method,
+        headers: headers(),
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      let data = null;
+      const ct = res.headers.get("content-type") || "";
+      if (ct.includes("application/json")) {
+        data = await res.json();
+      } else {
+        data = { message: await res.text() };
+      }
+      if (!res.ok) {
+        const err = new Error(data.message || data.detail || res.statusText);
+        err.status = res.status;
+        err.code = data.code;
+        throw err;
+      }
+      return data;
+    }
+
+    async function refreshList() {
+      const include = $("includeRevoked").checked ? "true" : "false";
+      const data = await api("GET", "/api/v1/admin/keys?include_revoked=" + include);
+      const tbody = $("keyRows");
+      tbody.innerHTML = "";
+      if (!data.items || !data.items.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="hint">No keys returned.</td></tr>';
+        return;
+      }
+      for (const item of data.items) {
+        const tr = document.createElement("tr");
+        const scopes = (item.scopes || []).join(", ");
+        const status = item.revoked ? "revoked" : "active";
+        tr.innerHTML = `
+          <td class="mono">${escapeHtml(item.key_id)}</td>
+          <td class="mono">${escapeHtml(scopes)}</td>
+          <td>${escapeHtml(item.label || "")}</td>
+          <td>${status}</td>
+          <td></td>`;
+        if (!item.revoked) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "danger";
+          btn.textContent = "Revoke";
+          btn.addEventListener("click", () => revokeKey(item.key_id));
+          tr.lastElementChild.appendChild(btn);
+        }
+        tbody.appendChild(tr);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    async function revokeKey(keyId) {
+      if (!confirm("Revoke key '" + keyId + "'? This cannot be undone.")) return;
+      try {
+        await api("DELETE", "/api/v1/admin/keys/" + encodeURIComponent(keyId));
+        showMsg($("status"), "Revoked " + keyId, true);
+        $("createdSecret").classList.remove("show");
+        await refreshList();
+      } catch (e) {
+        showMsg($("status"), (e.code ? e.code + ": " : "") + e.message, false);
+      }
+    }
+
+    $("btnConnect").addEventListener("click", async () => {
+      try {
+        const h = await fetch($("baseUrl").value.replace(/\/$/, "") + "/healthz?check_upstreams=false");
+        const body = await h.json();
+        showMsg($("status"), "API " + (body.status || "ok") + " — package " + (body.package_version || "?"), true);
+        await refreshList();
+      } catch (e) {
+        showMsg($("status"), "Cannot reach API: " + e.message, false);
+      }
+    });
+
+    $("btnRefresh").addEventListener("click", async () => {
+      try {
+        await refreshList();
+        showMsg($("status"), "Key list refreshed.", true);
+      } catch (e) {
+        showMsg($("status"), (e.code ? e.code + ": " : "") + e.message, false);
+      }
+    });
+
+    $("includeRevoked").addEventListener("change", () => {
+      refreshList().catch((e) => showMsg($("status"), e.message, false));
+    });
+
+    $("btnCreate").addEventListener("click", async () => {
+      const keyId = $("keyId").value.trim();
+      const label = $("label").value.trim();
+      const scopes = $("scopes").value.split(",").map((s) => s.trim()).filter(Boolean);
+      const payload = { scopes, label };
+      if (keyId) payload.key_id = keyId;
+      try {
+        const created = await api("POST", "/api/v1/admin/keys", payload);
+        $("secretValue").textContent = created.secret;
+        $("createdSecret").classList.add("show");
+        showMsg($("status"), "Created key " + created.key_id, true);
+        $("keyId").value = "";
+        await refreshList();
+      } catch (e) {
+        showMsg($("status"), (e.code ? e.code + ": " : "") + e.message, false);
+      }
+    });
+  </script>
+</body>
+</html>

@@ -45,6 +45,11 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     monkeypatch.delenv("ZENITH_OIDC_JWKS_URL", raising=False)
     monkeypatch.delenv("ZENITH_OIDC_AUDIENCE", raising=False)
     monkeypatch.delenv("ZENITH_OIDC_ISSUER", raising=False)
+    monkeypatch.delenv("ZENITH_OIDC_CLIENT_ID", raising=False)
+    monkeypatch.delenv("ZENITH_OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("ZENITH_OIDC_AUTHORIZE_URL", raising=False)
+    monkeypatch.delenv("ZENITH_OIDC_TOKEN_URL", raising=False)
+    monkeypatch.delenv("ZENITH_OIDC_REDIRECT_URI", raising=False)
     # Ephemeral vault + webhook log so tests don't touch shared disk state.
     vault = tmp_path_factory.mktemp("vault") / "keys.sqlite"
     whlog = tmp_path_factory.mktemp("whlog") / "deliveries.sqlite"

@@ -121,3 +121,31 @@ class ZenithApiClient:
             ):
                 return detail["id"]
         return None
+
+    def list_api_keys(self, *, include_revoked: bool = False) -> dict[str, Any]:
+        """List API keys (requires ``admin:keys``). Secrets are never returned."""
+        return self._request(
+            "GET",
+            "/api/v1/admin/keys",
+            params={"include_revoked": str(include_revoked).lower()},
+        )
+
+    def create_api_key(
+        self,
+        *,
+        key_id: str | None = None,
+        scopes: list[str] | None = None,
+        label: str = "",
+    ) -> dict[str, Any]:
+        """Create an API key; secret is returned once (requires ``admin:keys``)."""
+        payload: dict[str, Any] = {
+            "scopes": scopes or ["layers:read"],
+            "label": label,
+        }
+        if key_id:
+            payload["key_id"] = key_id
+        return self._request("POST", "/api/v1/admin/keys", json=payload)
+
+    def revoke_api_key(self, key_id: str) -> dict[str, Any]:
+        """Revoke an API key (requires ``admin:keys``)."""
+        return self._request("DELETE", f"/api/v1/admin/keys/{key_id}")

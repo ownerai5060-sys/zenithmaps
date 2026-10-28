@@ -9,8 +9,9 @@ Configure an external IdP to issue access tokens whose ``aud`` / ``iss`` match
 from the ``scope`` (space-delimited) or ``scp`` claim; if absent, the default
 ``ZENITH_OIDC_DEFAULT_SCOPES`` (default ``layers:read``) is applied.
 
-This module caches JWKS in-process. It is intentionally thin — not a full
-OIDC client (no authorization-code flow, no refresh).
+This module caches JWKS in-process for Bearer JWT validation. Authorization-code
+and refresh flows live in ``api.oidc_flow`` + ``/oauth/authorize`` /
+``/oauth/token`` / ``/oauth/callback`` (IdP proxy when env is set, else local stub).
 """
 
 from __future__ import annotations
