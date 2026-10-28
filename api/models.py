@@ -119,14 +119,15 @@ class MetricsResponse(BaseModel):
 
 
 class FeatureCollectionResponse(BaseModel):
-    """GeoJSON FeatureCollection wrapper for stub WFS-style queries (N1)."""
+    """GeoJSON FeatureCollection wrapper for WFS-lite queries."""
 
     type: Literal["FeatureCollection"] = "FeatureCollection"
     features: list[dict[str, Any]] = Field(default_factory=list)
     numberMatched: int = 0
     numberReturned: int = 0
     layer_id: str
-    mode: Literal["stub", "live"] = "stub"
+    mode: Literal["wfs_lite", "stub", "live"] = "wfs_lite"
+    backend: Literal["postgis", "fixture", "stub"] = "fixture"
     notes: Optional[str] = None
 
 

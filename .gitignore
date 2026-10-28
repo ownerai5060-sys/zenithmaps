@@ -130,3 +130,6 @@ dmypy.json
 
 # Local OpenAPI/Postman export output (regenerate via scripts/)
 artifacts/
+
+# Durable local vault / webhook delivery SQLite (never commit)
+.data/

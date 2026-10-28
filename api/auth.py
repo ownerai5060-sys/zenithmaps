@@ -1,12 +1,14 @@
-"""API-key and Bearer-token authentication with scopes (M3 + OAuth stub).
+"""API-key and Bearer-token authentication with scopes.
 
-Clients may authenticate with either:
+Clients may authenticate with:
 
 * ``X-API-Key: <secret>`` — primary path for third-party apps
-* ``Authorization: Bearer <opaque_token>`` — from ``POST /oauth/token``
+* ``Authorization: Bearer <opaque_token>`` — from ``POST /oauth/token`` stub
+* ``Authorization: Bearer <JWT>`` — when ``ZENITH_OIDC_JWKS_URL`` is set
+  (validated against the IdP JWKS; see ``api.oidc``)
 
-Demo keys live in ``api.config`` / the runtime ``KeyStore``. This is a
-workable stub for external-app onboarding, not a production IdP.
+Demo keys live in ``api.config`` / the runtime ``KeyStore``. Opaque OAuth is a
+local stub; prefer an external OIDC IdP for production SLA.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from api.config import Settings, get_settings
 from api.errors import ApiError
 from api.keystore import get_keystore
 from api.oauth import get_token_store
+from api.oidc import looks_like_jwt, validate_bearer_jwt
 
 API_KEY_HEADER_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
@@ -29,12 +32,12 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 @dataclass(frozen=True)
 class Principal:
-    """Authenticated caller derived from a valid API key or bearer token."""
+    """Authenticated caller derived from a valid API key, opaque token, or JWT."""
 
     key_id: str
     scopes: frozenset[str]
     label: str = ""
-    auth_via: str = "api_key"  # "api_key" | "bearer"
+    auth_via: str = "api_key"  # "api_key" | "bearer" | "oidc_jwt"
 
 
 async def require_api_key(
@@ -43,7 +46,7 @@ async def require_api_key(
     bearer: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
     settings: Settings = Depends(get_settings),
 ) -> Principal:
-    # Prefer explicit API key header; fall back to Bearer opaque token.
+    # Prefer explicit API key header; fall back to Bearer (JWT or opaque).
     if api_key:
         stored = get_keystore().lookup_by_secret(api_key)
         if stored is None:
@@ -62,7 +65,27 @@ async def require_api_key(
         return principal
 
     if bearer is not None and bearer.scheme.lower() == "bearer" and bearer.credentials:
-        access = get_token_store().lookup(bearer.credentials)
+        token = bearer.credentials
+
+        # OIDC JWT path (optional): try when JWKS configured and token looks like JWT.
+        if settings.oidc_jwks_url and looks_like_jwt(token):
+            jwt_principal = validate_bearer_jwt(token, settings)
+            if jwt_principal is None:
+                raise ApiError(
+                    status_code=401,
+                    code="unauthorized",
+                    message="Invalid or expired JWT",
+                )
+            principal = Principal(
+                key_id=f"oidc:{jwt_principal.subject}",
+                scopes=jwt_principal.scopes,
+                label=jwt_principal.label,
+                auth_via="oidc_jwt",
+            )
+            request.state.principal = principal
+            return principal
+
+        access = get_token_store().lookup(token)
         if access is None:
             raise ApiError(
                 status_code=401,
@@ -86,7 +109,6 @@ async def require_api_key(
         request.state.principal = principal
         return principal
 
-    _ = settings  # reserved for future auth policy toggles
     raise ApiError(
         status_code=401,
         code="unauthorized",

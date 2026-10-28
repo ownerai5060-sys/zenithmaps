@@ -1,4 +1,4 @@
-"""WFS-style features query (N1) — stub GeoJSON for catalog layers."""
+"""WFS-lite features query — GeoJSON FeatureCollection for catalog layers."""
 
 from __future__ import annotations
 
@@ -18,12 +18,13 @@ router = APIRouter(tags=["features"])
 @router.get(
     "/layers/{layer_id}/features",
     response_model=FeatureCollectionResponse,
-    summary="Query stub GeoJSON features for a catalog layer",
+    summary="WFS-lite GeoJSON features for a catalog layer",
     description=(
-        "Minimal WFS-style FeatureCollection for integration testing. "
-        "Features are **stubs** derived from catalog metadata — not a live "
-        "OGC WFS or PostGIS extract. Optional ``bbox=west,south,east,north`` "
-        "and ``limit`` filter the stub set."
+        "**WFS-lite**: bbox + limit FeatureCollection (not a full OGC WFS). "
+        "Tries optional PostGIS (`ZENITH_DATABASE_URL`) first, then bundled "
+        "fixtures under `api/fixtures/`, then deterministic stubs. "
+        "Optional ``bbox=west,south,east,north`` and ``limit`` filters apply "
+        "to fixture/stub backends (PostGIS applies them in SQL)."
     ),
 )
 def layer_features(

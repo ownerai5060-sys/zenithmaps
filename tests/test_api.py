@@ -1,9 +1,10 @@
-"""Acceptance tests for M2–M7 and S1–S5 platform API surface."""
+"""Acceptance tests for M2–N6 + WFS-lite / vault / OIDC / webhook durability."""
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -60,6 +61,7 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
         "/api/v1/admin/keys",
         "/api/v1/admin/keys/{key_id}",
         "/api/v1/admin/webhooks",
+        "/api/v1/admin/webhooks/deliveries",
         "/api/v1/admin/catalog",
         "/api/v1/admin/catalog/bump",
     }
@@ -369,10 +371,10 @@ def test_rate_limit_backend_header(client: TestClient, auth_headers: dict[str, s
     assert health["metrics"]["rate_limit_backend"] == "memory"
 
 
-def test_layer_features_stub(
+def test_layer_features_wfs_lite_fixture(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
-    """N1: stub GeoJSON FeatureCollection for catalog layers."""
+    """WFS-lite: bundled GeoJSON fixtures + bbox/limit (fallback without PostGIS)."""
     response = client.get(
         "/api/v1/layers/esa-worldcover-2020/features",
         headers=auth_headers,
@@ -381,7 +383,8 @@ def test_layer_features_stub(
     assert response.status_code == 200
     body = response.json()
     assert body["type"] == "FeatureCollection"
-    assert body["mode"] == "stub"
+    assert body["mode"] == "wfs_lite"
+    assert body["backend"] == "fixture"
     assert body["layer_id"] == "esa-worldcover-2020"
     assert body["numberReturned"] == 5
     assert len(body["features"]) == 5
@@ -395,11 +398,34 @@ def test_layer_features_stub(
     assert bboxed.status_code == 200
     # Tehran sample (~51.39, 35.69) should match.
     assert bboxed.json()["numberReturned"] >= 1
+    assert bboxed.json()["backend"] == "fixture"
 
     missing = client.get(
         "/api/v1/layers/no-such-layer/features", headers=auth_headers
     )
     assert missing.status_code == 404
+
+
+def test_features_postgis_falls_back_to_fixture(
+    client: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreachable PostGIS DSN must not break the features endpoint."""
+    from api.config import get_settings
+
+    monkeypatch.setenv(
+        "ZENITH_DATABASE_URL", "postgresql://nobody:invalid@127.0.0.1:1/none"
+    )
+    get_settings.cache_clear()
+    response = client.get(
+        "/api/v1/layers/esa-worldcover-2020/features",
+        headers=auth_headers,
+        params={"limit": 2},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "wfs_lite"
+    assert body["backend"] == "fixture"
+    get_settings.cache_clear()
 
 
 def test_tiles_catalog_allowlisted(
@@ -430,9 +456,7 @@ def test_tiles_catalog_allowlisted(
 def test_webhooks_register_and_catalog_bump(
     client: TestClient, admin_headers: dict[str, str]
 ) -> None:
-    """N3: register webhook URL; bump catalog / key create pings subscribers."""
-    from unittest.mock import MagicMock, patch
-
+    """N3+: register webhook; bump/key create pings; HMAC + delivery log."""
     created = client.post(
         "/api/v1/admin/webhooks",
         headers=admin_headers,
@@ -471,6 +495,12 @@ def test_webhooks_register_and_catalog_bump(
         assert body["webhook"]["attempted"] == 1
         assert body["webhook"]["succeeded"] == 1
         assert mock_http.post.called
+        # HMAC stub header present when signing secret configured.
+        call_kwargs = mock_http.post.call_args
+        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
+        assert headers is not None
+        assert "X-Zenith-Signature" in headers
+        assert headers["X-Zenith-Signature"].startswith("sha256=")
 
         key = client.post(
             "/api/v1/admin/keys",
@@ -480,6 +510,15 @@ def test_webhooks_register_and_catalog_bump(
         assert key.status_code == 201
         # Second delivery for admin.key_created
         assert mock_http.post.call_count >= 2
+
+    deliveries = client.get(
+        "/api/v1/admin/webhooks/deliveries", headers=admin_headers
+    )
+    assert deliveries.status_code == 200
+    del_body = deliveries.json()
+    assert del_body["count"] >= 2
+    assert del_body["durable"] is True
+    assert all(item["signature_header"] for item in del_body["items"])
 
     meta = client.get("/api/v1/admin/catalog", headers=admin_headers)
     assert meta.status_code == 200
@@ -546,3 +585,108 @@ def test_python_sdk_lists_layers(client: TestClient, auth_headers: dict[str, str
         assert feats["type"] == "FeatureCollection"
         tiles = sdk.list_tiles()
         assert tiles["zenith_hosts_tiles"] is False
+
+
+def test_key_vault_survives_reseed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Durable SQLite vault keeps admin-created keys across reset_and_seed."""
+    from api.config import get_settings
+    from api.keystore import KeyStore
+
+    vault = tmp_path / "keys.sqlite"
+    monkeypatch.setenv("ZENITH_KEY_VAULT_PATH", str(vault))
+    get_settings.cache_clear()
+
+    store = KeyStore()
+    store.reset_and_seed()
+    created = store.create(key_id="partner-durable", scopes=["layers:read"], label="d")
+    secret = created.secret
+
+    # New store instance + reseed from same vault file.
+    store2 = KeyStore()
+    store2.reset_and_seed()
+    found = store2.lookup_by_secret(secret)
+    assert found is not None
+    assert found.key_id == "partner-durable"
+    assert store2.durable is True
+    get_settings.cache_clear()
+
+
+def test_oidc_jwt_bearer_auth(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optional JWKS path accepts a signed RS256 JWT as Bearer auth."""
+    import time
+
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from jwt.algorithms import RSAAlgorithm
+
+    from api.config import get_settings
+    from api.oidc import get_jwks_cache
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    jwk = RSAAlgorithm.to_jwk(public_key, as_dict=True)
+    jwk["kid"] = "test-kid"
+    jwk["alg"] = "RS256"
+    jwk["use"] = "sig"
+
+    monkeypatch.setenv("ZENITH_OIDC_JWKS_URL", "https://idp.example/.well-known/jwks.json")
+    monkeypatch.setenv("ZENITH_OIDC_AUDIENCE", "zenith-api")
+    monkeypatch.setenv("ZENITH_OIDC_ISSUER", "https://idp.example/")
+    get_settings.cache_clear()
+    get_jwks_cache().reset()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {"keys": [jwk]}
+
+    token = jwt.encode(
+        {
+            "sub": "partner-oidc",
+            "aud": "zenith-api",
+            "iss": "https://idp.example/",
+            "exp": int(time.time()) + 600,
+            "scope": "layers:read",
+        },
+        private_key,
+        algorithm="RS256",
+        headers={"kid": "test-kid"},
+    )
+
+    with patch("api.oidc.httpx.Client") as client_cls:
+        mock_http = MagicMock()
+        mock_http.get.return_value = mock_resp
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        client_cls.return_value = mock_http
+
+        # Recreate app so settings pick up OIDC env.
+        from api.main import create_app
+
+        with TestClient(create_app()) as oidc_client:
+            ok = oidc_client.get(
+                "/api/v1/layers",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert ok.status_code == 200
+            assert ok.json()["count"] >= 1
+
+            bad = oidc_client.get(
+                "/api/v1/layers",
+                headers={"Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9.bad.sig"},
+            )
+            assert bad.status_code == 401
+
+    get_settings.cache_clear()
+    get_jwks_cache().reset()
+
+
+def test_api_v1_root_reports_wfs_lite_and_auth(client: TestClient) -> None:
+    response = client.get("/api/v1")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["features_mode"] == "wfs_lite"
+    assert body["auth"]["api_key"] == "X-API-Key"
+    assert "admin_webhook_deliveries" in body["endpoints"]

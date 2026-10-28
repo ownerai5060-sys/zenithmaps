@@ -1,0 +1,123 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "esa-2020-tehran",
+      "geometry": { "type": "Point", "coordinates": [51.3890, 35.6892] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Built-up",
+        "note": "Tehran sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-paris",
+      "geometry": { "type": "Point", "coordinates": [2.3522, 48.8566] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Built-up",
+        "note": "Paris sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-nyc",
+      "geometry": { "type": "Point", "coordinates": [-74.0060, 40.7128] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Built-up",
+        "note": "New York sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-nairobi",
+      "geometry": { "type": "Point", "coordinates": [37.7749, -1.2921] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Grassland",
+        "note": "Nairobi region sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-tokyo",
+      "geometry": { "type": "Point", "coordinates": [139.6917, 35.6895] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Built-up",
+        "note": "Tokyo sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-rome",
+      "geometry": { "type": "Point", "coordinates": [12.4964, 41.9028] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Built-up",
+        "note": "Rome sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-sydney",
+      "geometry": { "type": "Point", "coordinates": [151.2093, -33.8688] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Built-up",
+        "note": "Sydney sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-sao-paulo",
+      "geometry": { "type": "Point", "coordinates": [-46.6333, -23.5505] },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "Built-up",
+        "note": "São Paulo sample (bundled fixture)",
+        "year": 2020,
+        "source": "fixture"
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "esa-2020-extent-hint",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-10.0, -10.0],
+            [10.0, -10.0],
+            [10.0, 10.0],
+            [-10.0, 10.0],
+            [-10.0, -10.0]
+          ]
+        ]
+      },
+      "properties": {
+        "layer_id": "esa-worldcover-2020",
+        "class": "extent_hint",
+        "note": "Fixture extent polygon for clients; not authoritative.",
+        "source": "fixture"
+      }
+    }
+  ]
+}

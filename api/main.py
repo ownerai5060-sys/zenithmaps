@@ -1,4 +1,4 @@
-"""Zenith Maps Platform API entrypoint (M1–M7 + S1–S6 + P1–P4 + N1–N6).
+"""Zenith Maps Platform API entrypoint (M1–N6 + WFS-lite / vault / OIDC slice).
 
 Architecture decision (M1)
 --------------------------
@@ -41,6 +41,7 @@ from api.catalog import reset_catalog_version
 from api.keystore import get_keystore
 from api.metrics import get_metrics
 from api.oauth import get_token_store
+from api.oidc import get_jwks_cache
 from api.otel import setup_otel
 from api.rate_limit import RateLimitHeaderMiddleware, reset_rate_limiter
 from api.routers import (
@@ -53,6 +54,7 @@ from api.routers import (
     tiles,
     webhooks,
 )
+from api.webhook_log import get_delivery_log
 from api.webhooks import get_webhook_registry
 
 
@@ -91,7 +93,9 @@ async def lifespan(app: FastAPI):
     get_metrics().reset()
     get_keystore().reset_and_seed(settings.api_keys)
     get_token_store().reset()
+    get_jwks_cache().reset()
     get_webhook_registry().reset()
+    get_delivery_log().configure(settings.webhook_log_path)
     reset_catalog_version(1)
     reset_rate_limiter(settings)
     setup_otel(app, settings)
@@ -105,11 +109,13 @@ def create_app() -> FastAPI:
         version=__version__,
         description=(
             "Stable HTTP API for Zenith Maps catalog, layer metadata, structured "
-            "legends, allowlisted GetLegendGraphic, stub GeoJSON features, "
-            "allowlisted catalog tile URL discovery, admin key management, "
-            "catalog webhooks, and an OAuth2 client-credentials stub. "
-            "GraphQL is deferred. Streamlit pages in this repo are a UI demo; "
-            "external apps should integrate against `/api/v1`."
+            "legends, allowlisted GetLegendGraphic, WFS-lite GeoJSON features "
+            "(fixtures / optional PostGIS), allowlisted catalog tile URL "
+            "discovery, durable API-key vault, catalog webhooks with delivery "
+            "log + HMAC stub, OAuth2 client-credentials stub, and optional "
+            "OIDC JWT (JWKS) Bearer validation. GraphQL is deferred. Streamlit "
+            "pages in this repo are a UI demo; external apps should integrate "
+            "against `/api/v1`."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -179,12 +185,21 @@ def create_app() -> FastAPI:
                     "allowlist": "/api/v1/security/allowlist",
                     "admin_keys": "/api/v1/admin/keys",
                     "admin_webhooks": "/api/v1/admin/webhooks",
+                    "admin_webhook_deliveries": "/api/v1/admin/webhooks/deliveries",
                     "admin_catalog": "/api/v1/admin/catalog",
                     "oauth_token": "/oauth/token",
                     "healthz": "/healthz",
                     "metrics": "/metrics",
                     "metrics_prometheus": "/metrics/prometheus",
                 },
+                "auth": {
+                    "api_key": "X-API-Key",
+                    "oauth_opaque": "/oauth/token",
+                    "oidc_jwt": bool(settings.oidc_jwks_url),
+                },
+                "features_mode": "wfs_lite",
+                "key_vault_durable": bool(settings.key_vault_path),
+                "webhook_log_durable": bool(settings.webhook_log_path),
                 "request_id": get_request_id(request),
             },
             headers={REQUEST_ID_HEADER: get_request_id(request)},

@@ -1,17 +1,25 @@
-"""Catalog-change webhook stub (N3).
+"""Catalog-change webhooks with durable delivery log + HMAC stub (N3+).
 
 Operators register callback URLs. The API fires a best-effort HTTP POST when:
 
 * an admin API key is created, or
 * the catalog version is bumped via the admin endpoint.
 
-Deliveries are in-process, fire-and-forget, and **not** a durable queue.
-Failed pings are recorded on the subscription but never fail the triggering
-request. No open SSRF: only ``https`` (and ``http`` for localhost in tests).
+Deliveries are fire-and-forget for the triggering request, but each attempt is
+recorded in the delivery log (SQLite when ``ZENITH_WEBHOOK_LOG_PATH`` is set).
+When ``ZENITH_WEBHOOK_SIGNING_SECRET`` is set, requests include::
+
+    X-Zenith-Signature: sha256=<hex hmac of raw JSON body>
+
+Failed pings never fail the triggering request. Soft SSRF guard: only ``https``
+(and ``http`` for localhost in tests).
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import secrets
 import threading
@@ -23,8 +31,11 @@ from urllib.parse import urlparse
 import httpx
 
 from api.config import get_settings
+from api.webhook_log import get_delivery_log
 
 logger = logging.getLogger("zenith.webhooks")
+
+SIGNATURE_HEADER = "X-Zenith-Signature"
 
 
 @dataclass
@@ -143,11 +154,9 @@ def _validate_webhook_url(url: str) -> str:
         raise ValueError("webhook URL must be http or https")
     if not host:
         raise ValueError("webhook URL missing host")
-    # Soft SSRF guard: block link-local / metadata IPs; allow localhost for tests.
     if host.startswith("169.254.") or host in {"metadata.google.internal"}:
         raise ValueError("webhook host is blocked")
     if scheme == "http" and host not in {"localhost", "127.0.0.1", "::1"}:
-        # Prefer HTTPS for non-local callbacks.
         settings = get_settings()
         if getattr(settings, "webhooks_require_https", True):
             raise ValueError("non-local webhook URLs must use https")
@@ -164,6 +173,79 @@ def build_event_payload(event: str, data: dict[str, Any] | None = None) -> dict[
         "occurred_at": time.time(),
         "data": data or {},
     }
+
+
+def sign_payload(body: bytes, secret: str) -> str:
+    """Return ``sha256=<hex>`` HMAC over the raw JSON body (stub signature header)."""
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def _delivery_headers(event: str, body: bytes) -> dict[str, str]:
+    settings = get_settings()
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "zenith-api-webhook/0.5",
+        "X-Zenith-Event": event,
+    }
+    secret = (settings.webhook_signing_secret or "").strip()
+    if secret:
+        headers[SIGNATURE_HEADER] = sign_payload(body, secret)
+    return headers
+
+
+def _post_one(
+    sub: WebhookSubscription,
+    event: str,
+    payload: dict[str, Any],
+    *,
+    http: httpx.Client,
+) -> tuple[bool, str | None, int | None, str | None]:
+    """Returns (ok, error, http_status, signature_header)."""
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    headers = _delivery_headers(event, body)
+    signature = headers.get(SIGNATURE_HEADER)
+    try:
+        response = http.post(sub.url, content=body, headers=headers)
+        if response.status_code >= 400:
+            msg = f"HTTP {response.status_code}"
+            get_webhook_registry().record_ping(sub.id, status="error", error=msg)
+            get_delivery_log().append(
+                webhook_id=sub.id,
+                event=event,
+                url=sub.url,
+                status="error",
+                http_status=response.status_code,
+                error=msg,
+                signature_header=signature,
+            )
+            return False, msg, response.status_code, signature
+        get_webhook_registry().record_ping(sub.id, status="ok", error=None)
+        get_delivery_log().append(
+            webhook_id=sub.id,
+            event=event,
+            url=sub.url,
+            status="ok",
+            http_status=response.status_code,
+            error=None,
+            signature_header=signature,
+        )
+        return True, None, response.status_code, signature
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("webhook delivery failed id=%s: %s", sub.id, exc)
+        get_webhook_registry().record_ping(sub.id, status="error", error=str(exc))
+        get_delivery_log().append(
+            webhook_id=sub.id,
+            event=event,
+            url=sub.url,
+            status="error",
+            http_status=None,
+            error=str(exc),
+            signature_header=signature,
+        )
+        return False, str(exc), None, signature
 
 
 def deliver_webhooks(
@@ -183,27 +265,11 @@ def deliver_webhooks(
     try:
         for sub in targets:
             delivery.attempted += 1
-            try:
-                response = http.post(
-                    sub.url,
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "zenith-api-webhook/0.4",
-                        "X-Zenith-Event": event,
-                    },
-                )
-                if response.status_code >= 400:
-                    msg = f"HTTP {response.status_code}"
-                    registry.record_ping(sub.id, status="error", error=msg)
-                    delivery.failures.append(f"{sub.id}: {msg}")
-                else:
-                    registry.record_ping(sub.id, status="ok", error=None)
-                    delivery.succeeded += 1
-            except Exception as exc:  # noqa: BLE001 — best-effort stub
-                logger.warning("webhook delivery failed id=%s: %s", sub.id, exc)
-                registry.record_ping(sub.id, status="error", error=str(exc))
-                delivery.failures.append(f"{sub.id}: {exc}")
+            ok, err, _status, _sig = _post_one(sub, event, payload, http=http)
+            if ok:
+                delivery.succeeded += 1
+            elif err:
+                delivery.failures.append(f"{sub.id}: {err}")
     finally:
         if owns_client:
             http.close()
@@ -245,27 +311,11 @@ def ping_one(
     http = client or httpx.Client(timeout=timeout_s)
     delivery.attempted = 1
     try:
-        try:
-            response = http.post(
-                sub.url,
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "zenith-api-webhook/0.4",
-                    "X-Zenith-Event": "webhook.ping",
-                },
-            )
-            if response.status_code >= 400:
-                msg = f"HTTP {response.status_code}"
-                registry.record_ping(sub.id, status="error", error=msg)
-                delivery.failures.append(f"{sub.id}: {msg}")
-            else:
-                registry.record_ping(sub.id, status="ok", error=None)
-                delivery.succeeded = 1
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("webhook ping failed id=%s: %s", sub.id, exc)
-            registry.record_ping(sub.id, status="error", error=str(exc))
-            delivery.failures.append(f"{sub.id}: {exc}")
+        ok, err, _status, _sig = _post_one(sub, "webhook.ping", payload, http=http)
+        if ok:
+            delivery.succeeded = 1
+        elif err:
+            delivery.failures.append(f"{sub.id}: {err}")
     finally:
         if owns_client:
             http.close()
