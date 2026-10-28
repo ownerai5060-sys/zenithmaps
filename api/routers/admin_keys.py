@@ -83,7 +83,7 @@ def list_keys(
 )
 def create_key(
     body: CreateKeyRequest,
-    _principal: Principal = Depends(require_rate_limited("admin:keys")),
+    principal: Principal = Depends(require_rate_limited("admin:keys")),
 ) -> CreateKeyResponse:
     try:
         created = get_keystore().create(
@@ -95,6 +95,13 @@ def create_key(
         raise ApiError(status_code=400, code="bad_request", message=str(exc)) from exc
     except KeyError as exc:
         raise ApiError(status_code=409, code="conflict", message=str(exc)) from exc
+    # Best-effort catalog/admin webhook ping (N3); never fails key create.
+    try:
+        from api.webhooks import notify_key_created
+
+        notify_key_created(key_id=created.key_id, actor=principal.key_id)
+    except Exception:  # noqa: BLE001
+        pass
     return CreateKeyResponse(
         key_id=created.key_id,
         secret=created.secret,

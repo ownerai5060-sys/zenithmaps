@@ -116,3 +116,46 @@ class MetricsResponse(BaseModel):
     service: str
     api_version: str
     metrics: dict[str, Any]
+
+
+class FeatureCollectionResponse(BaseModel):
+    """GeoJSON FeatureCollection wrapper for stub WFS-style queries (N1)."""
+
+    type: Literal["FeatureCollection"] = "FeatureCollection"
+    features: list[dict[str, Any]] = Field(default_factory=list)
+    numberMatched: int = 0
+    numberReturned: int = 0
+    layer_id: str
+    mode: Literal["stub", "live"] = "stub"
+    notes: Optional[str] = None
+
+
+class TileLayerInfo(BaseModel):
+    """Allowlisted XYZ/WMTS-style tile template from the catalog (N4)."""
+
+    layer_id: str
+    title: str
+    kind: Literal["wms", "xyz", "geojson", "other"]
+    tile_url_template: Optional[str] = None
+    attribution: Optional[str] = None
+    hosts: list[str] = Field(default_factory=list)
+    allowlisted: bool = False
+    notes: Optional[str] = None
+
+
+class TileListResponse(BaseModel):
+    items: list[TileLayerInfo]
+    count: int
+    zenith_hosts_tiles: bool = False
+    notes: Optional[str] = None
+
+
+class CatalogMeta(BaseModel):
+    version: int
+    updated_at: float
+    layer_count: int
+
+
+class CatalogBumpResponse(CatalogMeta):
+    reason: str
+    webhook: Optional[dict[str, Any]] = None

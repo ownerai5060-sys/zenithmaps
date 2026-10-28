@@ -3,20 +3,34 @@
 Interactive Zenith map demos (Streamlit + leafmap) plus a **platform HTTP API**
 for external applications.
 
+## دربارهٔ زنیت / About Zenith (محصول)
+
+**زنیت** پلتفرم نقشه‌های تعاملی است: برای کاربر نهایی دموهای Streamlit، و برای
+اپ‌های دیگر یک **API پایدار** زیر `/api/v1`.
+
+| چه می‌خواهید؟ | از کجا شروع کنید؟ |
+|---------------|-------------------|
+| دیدن نقشه در مرورگر | `streamlit run Home.py` |
+| وصل کردن اپ خودتان به کاتالوگ لایه / legend / کاشی‌های تأییدشده | `uvicorn api.main:app` → `/docs` |
+| SDK نازک پایتون / JS | `sdk/python`, `sdk/js` |
+| خروجی Postman / OpenAPI | `python scripts/export_openapi_collection.py` |
+
+این مخزن **سرویس کاشی اختصاصی زنیت (WMTS/CDN) ندارد** و **GraphQL ندارد**
+(عمداً به تعویق افتاده). کاشی‌ها فقط همان URLهای allowlist‌شدهٔ کاتالوگ هستند.
+
+---
+
 ## Architecture
 
 | Surface | Path | Role |
 |---------|------|------|
 | UI demo | `Home.py`, `pages/` | Streamlit map demos — not a stable integration API |
-| Platform API | `api/` | FastAPI under `/api/v1` — catalog, metadata, legend JSON + GetLegendGraphic |
+| Platform API | `api/` | FastAPI under `/api/v1` — catalog, legend, stub features, tiles metadata, webhooks |
 | Shared client | `zenith_client/` | Helper used by Streamlit and examples |
+| Official SDK starters | `sdk/python`, `sdk/js` | Thin Python package + JS fetch helper (N2) |
 
 External apps should integrate against the API, not against Streamlit page
 routes. See OpenAPI at `/docs` when the API is running.
-
-Bilingual integration / staging notes:
-[docs in agent store](https://github.com/ownerai5060-sys/zenithmaps) — see project
-docs `zenith-api-integration-guide.md` (also mirrored conceptually below).
 
 ## Platform API (quick start)
 
@@ -26,10 +40,11 @@ uvicorn api.main:app --reload --port 8000
 ```
 
 - Docs: http://127.0.0.1:8000/docs
-- Health: `GET /healthz` (optional `?check_upstreams=true`)
-- Metrics: `GET /metrics`
-- Catalog: `GET /api/v1/layers` with header `X-API-Key: zenith_demo_key_layers_read`
-- Legend image: `GET /api/v1/layers/{id}/legend/image`
+- Health: `GET /healthz`
+- Catalog: `GET /api/v1/layers` with `X-API-Key: zenith_demo_key_layers_read`
+- Stub features (N1): `GET /api/v1/layers/{id}/features`
+- Allowlisted tile templates (N4): `GET /api/v1/tiles`
+- Admin webhooks (N3): `POST /api/v1/admin/webhooks` (scope `admin:keys`)
 
 Demo API keys are stubs for local/third-party onboarding only. Override with
 `ZENITH_API_KEYS`, `ZENITH_CORS_ORIGINS`, `ZENITH_WMS_ALLOWED_HOSTS`,
@@ -38,14 +53,29 @@ in real deployments.
 
 ```bash
 pytest
-ruff check api tests zenith_client examples
+ruff check api tests zenith_client examples scripts
 python examples/third_party_client.py   # requires API on :8000
+python scripts/export_openapi_collection.py --out-dir artifacts/api-export
+pip install -e sdk/python
 ```
 
-Sample browser client: `examples/third_party_client.html`
+Sample browser client: `examples/third_party_client.html`  
+JS helper: `sdk/js/zenith-maps.js`
 
 Pinned dependencies: `requirements-api.txt` + `requirements-api.lock.txt`.  
 CI: `.github/workflows/api-ci.yml` (lint + OpenAPI contract tests).
+
+### GraphQL (N5 — deferred)
+
+No GraphQL schema is shipped. Prefer REST `/api/v1` + OpenAPI. Revisit only if
+multiple clients need flexible field selection beyond the catalog/features surface.
+
+### Tiles / WMTS / XYZ (N4)
+
+Zenith does **not** operate a private tile CDN. `GET /api/v1/tiles` lists
+`tile_url_template` values already on catalog layers (e.g. OpenTopoMap) when
+their hosts are allowlisted. Clients fetch those upstreams directly — this API
+does not proxy open CDNs.
 
 ## Streamlit UI demo
 
