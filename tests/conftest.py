@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
-from api.config import get_settings
-from api.keystore import get_keystore
-from api.main import create_app
-from api.metrics import get_metrics
-from api.oauth import get_token_store
-from api.rate_limit import get_rate_limiter, reset_rate_limiter
+# Ensure sdk/python is importable even when pytest.ini pythonpath is ignored.
+_SDK = Path(__file__).resolve().parents[1] / "sdk" / "python"
+if str(_SDK) not in sys.path:
+    sys.path.insert(0, str(_SDK))
+
+from api.catalog import reset_catalog_version  # noqa: E402
+from api.config import get_settings  # noqa: E402
+from api.keystore import get_keystore  # noqa: E402
+from api.main import create_app  # noqa: E402
+from api.metrics import get_metrics  # noqa: E402
+from api.oauth import get_token_store  # noqa: E402
+from api.rate_limit import get_rate_limiter, reset_rate_limiter  # noqa: E402
+from api.webhooks import get_webhook_registry  # noqa: E402
 
 DEMO_API_KEY = "zenith_demo_key_layers_read"
 ADMIN_API_KEY = "zenith_admin_key_manage"
@@ -34,6 +44,8 @@ def _test_env(monkeypatch: pytest.MonkeyPatch) -> None:
     get_metrics().reset()
     get_token_store().reset()
     get_keystore().reset_and_seed()
+    get_webhook_registry().reset()
+    reset_catalog_version(1)
     yield
     get_settings.cache_clear()
     reset_rate_limiter()
@@ -41,6 +53,8 @@ def _test_env(monkeypatch: pytest.MonkeyPatch) -> None:
     get_metrics().reset()
     get_token_store().reset()
     get_keystore().reset_and_seed()
+    get_webhook_registry().reset()
+    reset_catalog_version(1)
 
 
 @pytest.fixture()

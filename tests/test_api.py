@@ -52,10 +52,16 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
         "/api/v1/layers/{layer_id}",
         "/api/v1/layers/{layer_id}/legend",
         "/api/v1/layers/{layer_id}/legend/image",
+        "/api/v1/layers/{layer_id}/features",
+        "/api/v1/tiles",
+        "/api/v1/tiles/{layer_id}",
         "/api/v1/security/check-url",
         "/api/v1/security/allowlist",
         "/api/v1/admin/keys",
         "/api/v1/admin/keys/{key_id}",
+        "/api/v1/admin/webhooks",
+        "/api/v1/admin/catalog",
+        "/api/v1/admin/catalog/bump",
     }
     assert required_paths <= set(schema["paths"])
     # Layers list declares API key security via dependency; schema must list the path.
@@ -361,3 +367,182 @@ def test_rate_limit_backend_header(client: TestClient, auth_headers: dict[str, s
     assert response.headers.get("X-RateLimit-Backend") == "memory"
     health = client.get("/healthz").json()
     assert health["metrics"]["rate_limit_backend"] == "memory"
+
+
+def test_layer_features_stub(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """N1: stub GeoJSON FeatureCollection for catalog layers."""
+    response = client.get(
+        "/api/v1/layers/esa-worldcover-2020/features",
+        headers=auth_headers,
+        params={"limit": 5},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "FeatureCollection"
+    assert body["mode"] == "stub"
+    assert body["layer_id"] == "esa-worldcover-2020"
+    assert body["numberReturned"] == 5
+    assert len(body["features"]) == 5
+    assert body["features"][0]["geometry"]["type"] == "Point"
+
+    bboxed = client.get(
+        "/api/v1/layers/esa-worldcover-2020/features",
+        headers=auth_headers,
+        params={"bbox": "50,35,52,36", "limit": 50},
+    )
+    assert bboxed.status_code == 200
+    # Tehran sample (~51.39, 35.69) should match.
+    assert bboxed.json()["numberReturned"] >= 1
+
+    missing = client.get(
+        "/api/v1/layers/no-such-layer/features", headers=auth_headers
+    )
+    assert missing.status_code == 404
+
+
+def test_tiles_catalog_allowlisted(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """N4: expose catalog XYZ templates; Zenith does not host tiles."""
+    listed = client.get("/api/v1/tiles", headers=auth_headers)
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["zenith_hosts_tiles"] is False
+    assert body["count"] >= 1
+    ids = {item["layer_id"] for item in body["items"]}
+    assert "opentopomap" in ids
+    otm = next(i for i in body["items"] if i["layer_id"] == "opentopomap")
+    assert otm["allowlisted"] is True
+    assert "tile.opentopomap.org" in (otm["tile_url_template"] or "")
+
+    detail = client.get("/api/v1/tiles/opentopomap", headers=auth_headers)
+    assert detail.status_code == 200
+    assert detail.json()["allowlisted"] is True
+
+    # WMS-only layer has no tile template → 404 tiles_not_available
+    no_tiles = client.get("/api/v1/tiles/esa-worldcover-2020", headers=auth_headers)
+    assert no_tiles.status_code == 404
+    assert no_tiles.json()["code"] == "tiles_not_available"
+
+
+def test_webhooks_register_and_catalog_bump(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    """N3: register webhook URL; bump catalog / key create pings subscribers."""
+    from unittest.mock import MagicMock, patch
+
+    created = client.post(
+        "/api/v1/admin/webhooks",
+        headers=admin_headers,
+        json={
+            "url": "https://example.com/zenith-hook",
+            "events": ["catalog.updated", "admin.key_created"],
+            "label": "Partner hook",
+            "webhook_id": "wh-partner",
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["id"] == "wh-partner"
+
+    listed = client.get("/api/v1/admin/webhooks", headers=admin_headers)
+    assert listed.status_code == 200
+    assert listed.json()["count"] == 1
+
+    mock_response = MagicMock()
+    mock_response.status_code = 204
+
+    with patch("api.webhooks.httpx.Client") as client_cls:
+        mock_http = MagicMock()
+        mock_http.post.return_value = mock_response
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        client_cls.return_value = mock_http
+
+        bumped = client.post(
+            "/api/v1/admin/catalog/bump",
+            headers=admin_headers,
+            json={"reason": "test-bump"},
+        )
+        assert bumped.status_code == 200
+        body = bumped.json()
+        assert body["version"] == 2
+        assert body["webhook"]["attempted"] == 1
+        assert body["webhook"]["succeeded"] == 1
+        assert mock_http.post.called
+
+        key = client.post(
+            "/api/v1/admin/keys",
+            headers=admin_headers,
+            json={"key_id": "hooked-partner", "scopes": ["layers:read"]},
+        )
+        assert key.status_code == 201
+        # Second delivery for admin.key_created
+        assert mock_http.post.call_count >= 2
+
+    meta = client.get("/api/v1/admin/catalog", headers=admin_headers)
+    assert meta.status_code == 200
+    assert meta.json()["version"] == 2
+
+    deleted = client.delete(
+        "/api/v1/admin/webhooks/wh-partner", headers=admin_headers
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["active"] is False
+
+
+def test_api_v1_root_marks_graphql_deferred(client: TestClient) -> None:
+    """N5: GraphQL explicitly deferred on the version root."""
+    response = client.get("/api/v1")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["graphql"] == "deferred"
+    assert "features" in body["endpoints"]
+    assert "tiles" in body["endpoints"]
+
+
+def test_export_openapi_collection_script(tmp_path) -> None:
+    """N2: export script writes OpenAPI + Postman collection without a server."""
+    from scripts.export_openapi_collection import main
+
+    out = tmp_path / "export"
+    assert main(["--out-dir", str(out)]) == 0
+    openapi = (out / "openapi.json").read_text(encoding="utf-8")
+    postman = (out / "postman.collection.json").read_text(encoding="utf-8")
+    assert '"openapi"' in openapi
+    assert "/api/v1/layers/{layer_id}/features" in openapi
+    assert "zenith_api_key" in postman
+    assert "item" in postman
+
+
+def test_python_sdk_lists_layers(client: TestClient, auth_headers: dict[str, str]) -> None:
+    """N2: Python SDK starter wraps the same catalog endpoints."""
+    import httpx
+
+    from zenith_maps import ZenithMapsClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.url.query:
+            path = f"{path}?{request.url.query}"
+        headers = {k.decode(): v.decode() for k, v in request.headers.raw}
+        resp = client.request(request.method, path, headers=headers)
+        return httpx.Response(
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+            content=resp.content,
+            request=request,
+        )
+
+    with ZenithMapsClient(
+        base_url="http://testserver",
+        api_key=auth_headers["X-API-Key"],
+        transport=httpx.MockTransport(handler),
+    ) as sdk:
+        layers = sdk.list_layers()
+        assert layers["count"] >= 2
+        feats = sdk.get_features("esa-worldcover-2020", limit=3)
+        assert feats["type"] == "FeatureCollection"
+        tiles = sdk.list_tiles()
+        assert tiles["zenith_hosts_tiles"] is False

@@ -29,14 +29,18 @@ jobs:
 
       - name: Lint (ruff)
         run: |
-          ruff check api tests zenith_client examples
+          ruff check api tests zenith_client examples scripts
 
       - name: Compile check
-        run: python -m compileall -q api zenith_client tests
+        run: python -m compileall -q api zenith_client tests scripts sdk/python/zenith_maps
 
       - name: Pytest (unit + OpenAPI contract)
         env:
           ZENITH_HEALTH_CHECK_UPSTREAMS: "false"
           ZENITH_RATE_LIMIT_ENABLED: "true"
           ZENITH_RATE_LIMIT_REQUESTS: "1000"
+          PYTHONPATH: sdk/python:.
         run: pytest -q
+
+      - name: Export OpenAPI + Postman collection
+        run: python scripts/export_openapi_collection.py --out-dir artifacts/api-export

@@ -40,12 +40,19 @@ class Settings:
         "http://localhost:8501",
         "http://127.0.0.1:8501",
     )
-    # Hostnames (lowercase, no port) that may appear in WMS/tile URLs (M6).
+    # Hostnames (lowercase, no port) that may appear in WMS/tile URLs (M6/N4).
+    # Includes catalog XYZ hosts already referenced by curated layers — not
+    # an open CDN invent list.
     wms_allowed_hosts: FrozenSet[str] = frozenset(
         {
             "services.terrascope.be",
+            "a.tile.opentopomap.org",
+            "b.tile.opentopomap.org",
+            "c.tile.opentopomap.org",
         }
     )
+    # When True, non-local webhook callback URLs must use https (N3).
+    webhooks_require_https: bool = True
     # Optional layer-name allowlist per host. Empty set = any layer on that host.
     wms_allowed_layers: FrozenSet[str] = frozenset(
         {
@@ -157,7 +164,12 @@ def get_settings() -> Settings:
     )
     hosts = _parse_csv(
         os.getenv("ZENITH_WMS_ALLOWED_HOSTS"),
-        ("services.terrascope.be",),
+        (
+            "services.terrascope.be",
+            "a.tile.opentopomap.org",
+            "b.tile.opentopomap.org",
+            "c.tile.opentopomap.org",
+        ),
     )
     layers = _parse_csv(
         os.getenv("ZENITH_WMS_ALLOWED_LAYERS"),
@@ -191,4 +203,5 @@ def get_settings() -> Settings:
         otel_exporter_otlp_endpoint=os.getenv(
             "ZENITH_OTEL_EXPORTER_OTLP_ENDPOINT", ""
         ).strip(),
+        webhooks_require_https=_bool("ZENITH_WEBHOOKS_REQUIRE_HTTPS", True),
     )
