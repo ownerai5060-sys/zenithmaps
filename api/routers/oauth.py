@@ -454,10 +454,31 @@ def _clear_portal_cookies(
     "/oauth/token",
     response_model=TokenResponse,
     summary="OAuth2 token (client_credentials / auth-code / refresh)",
+    description=(
+        "Issues an access token. Accepts **JSON** (`TokenJsonRequest`) or "
+        "**application/x-www-form-urlencoded** with the same fields. "
+        "Supported grants: `client_credentials`, `authorization_code` "
+        "(PKCE S256 when a challenge was used), `refresh_token`."
+    ),
     responses={
         400: {"description": "Unsupported grant / bad request / invalid_grant"},
         401: {"description": "Invalid client"},
         503: {"description": "OAuth disabled"},
+    },
+    openapi_extra={
+        # Declared so generators see a body even though the handler parses
+        # Content-Type manually (JSON vs form). custom_openapi also patches this.
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/TokenJsonRequest"},
+                },
+                "application/x-www-form-urlencoded": {
+                    "schema": {"$ref": "#/components/schemas/TokenJsonRequest"},
+                },
+            },
+        }
     },
 )
 async def token_endpoint(

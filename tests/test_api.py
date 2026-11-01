@@ -87,6 +87,70 @@ def test_openapi_contract_required_paths(client: TestClient) -> None:
     assert "layers" in layers_get.get("tags", [])
 
 
+def test_openapi_partner_contract_p0(client: TestClient) -> None:
+    """P0 partner-contract gaps: ErrorEnvelope, auth errors, token body, schemes."""
+    schema = client.get("/openapi.json").json()
+    components = schema["components"]
+    schemas = components["schemas"]
+    security_schemes = components["securitySchemes"]
+
+    # 1) ErrorEnvelope schema with required fields
+    envelope = schemas["ErrorEnvelope"]
+    required = set(envelope.get("required") or [])
+    assert {"code", "message", "request_id"} <= required
+    props = envelope.get("properties") or {}
+    assert {"code", "message", "request_id"} <= set(props)
+
+    # Misleading FastAPI validation models should not remain as the public error shape
+    assert "HTTPValidationError" not in schemas
+
+    # 2) Authenticated ops document 401/403/429 with ErrorEnvelope
+    layers_get = schema["paths"]["/api/v1/layers"]["get"]
+    assert layers_get.get("security")
+    for status in ("401", "403", "429"):
+        resp = layers_get["responses"][status]
+        ref = resp["content"]["application/json"]["schema"]["$ref"]
+        assert ref.endswith("/ErrorEnvelope")
+    # 422 also uses ErrorEnvelope (not HTTPValidationError)
+    check_url = schema["paths"]["/api/v1/security/check-url"]["post"]
+    assert check_url["responses"]["422"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/ErrorEnvelope")
+
+    # 3) POST /oauth/token requestBody (JSON + form) + TokenJsonRequest schema
+    token_op = schema["paths"]["/oauth/token"]["post"]
+    body = token_op["requestBody"]
+    assert body.get("required") is True
+    content = body["content"]
+    assert "application/json" in content
+    assert "application/x-www-form-urlencoded" in content
+    assert content["application/json"]["schema"]["$ref"].endswith("/TokenJsonRequest")
+    assert "TokenJsonRequest" in schemas
+    token_props = set((schemas["TokenJsonRequest"].get("properties") or {}))
+    assert "grant_type" in token_props
+    assert "code_verifier" in token_props
+
+    # 4) Useful examples on key endpoints
+    assert "example" in layers_get["responses"]["200"]["content"]["application/json"]
+    assert "examples" in content["application/json"]
+
+    # 5) Portal cookie / CSRF / OAuth2 scopes securitySchemes
+    assert "PortalSessionCookie" in security_schemes
+    assert security_schemes["PortalSessionCookie"]["in"] == "cookie"
+    assert "CsrfHeader" in security_schemes
+    assert security_schemes["CsrfHeader"]["name"] == "X-CSRF-Token"
+    oauth2 = security_schemes["OAuth2ClientCredentials"]
+    assert oauth2["type"] == "oauth2"
+    scopes = oauth2["flows"]["clientCredentials"]["scopes"]
+    assert "layers:read" in scopes
+    assert "admin:keys" in scopes
+    # Protected ops advertise portal cookie alongside API key / Bearer
+    scheme_names = {key for entry in layers_get["security"] for key in entry}
+    assert "PortalSessionCookie" in scheme_names
+    assert "APIKeyHeader" in scheme_names
+    assert "HTTPBearer" in scheme_names
+
+
 def test_layers_requires_api_key(client: TestClient) -> None:
     response = client.get("/api/v1/layers")
     assert response.status_code == 401

@@ -17,10 +17,34 @@ from typing import Any
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 REQUEST_ID_HEADER = "X-Request-ID"
+
+
+class ErrorEnvelope(BaseModel):
+    """Stable machine-readable error body used by all Zenith HTTP errors."""
+
+    code: str = Field(
+        ...,
+        description=(
+            "Stable machine code (e.g. unauthorized, forbidden, "
+            "validation_error, rate_limited, not_found)"
+        ),
+        examples=["unauthorized"],
+    )
+    message: str = Field(
+        ...,
+        description="Human-readable explanation suitable for logs / UI",
+        examples=["Missing X-API-Key header, Bearer token, or portal session cookie"],
+    )
+    request_id: str = Field(
+        ...,
+        description="Correlation id also returned as X-Request-ID",
+        examples=["00000000-0000-4000-8000-000000000001"],
+    )
 
 
 def new_request_id() -> str:

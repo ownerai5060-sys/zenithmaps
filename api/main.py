@@ -47,6 +47,7 @@ from api.metrics import get_metrics
 from api.consent import get_consent_store
 from api.oauth import get_token_store
 from api.oidc import get_jwks_cache
+from api.openapi_schema import install_custom_openapi
 from api.otel import setup_otel
 from api.rate_limit import RateLimitHeaderMiddleware, reset_rate_limiter
 from api.routers import (
@@ -191,6 +192,12 @@ def create_app() -> FastAPI:
     application.include_router(security.router, prefix="/api/v1")
     application.include_router(admin_keys.router, prefix="/api/v1")
     application.include_router(webhooks.router, prefix="/api/v1")
+
+    # Partner-facing OpenAPI enrichment (ErrorEnvelope, auth errors, examples).
+    install_custom_openapi(
+        application,
+        portal_cookie_name=settings.portal_cookie_name or "zenith_portal_token",
+    )
 
     static_root = Path(__file__).resolve().parent.parent / "static"
     if static_root.is_dir():
