@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from typing import Callable
 
 from fastapi import Depends, Request, Security
-from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import (
+    APIKeyCookie,
+    APIKeyHeader,
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+)
 
 from api.config import Settings, get_settings
 from api.csrf import require_portal_csrf_if_needed
@@ -29,8 +34,16 @@ from api.oidc import looks_like_jwt, validate_bearer_jwt
 from api.session_store import get_session_store
 
 API_KEY_HEADER_NAME = "X-API-Key"
+# Default cookie name; Settings.portal_cookie_name may override at runtime.
+# OpenAPI uses this scheme name; custom_openapi aligns the cookie ``name``.
+PORTAL_COOKIE_SCHEME_NAME = "zenith_portal_token"
 api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
 bearer_scheme = HTTPBearer(auto_error=False)
+portal_cookie_scheme = APIKeyCookie(
+    name=PORTAL_COOKIE_SCHEME_NAME,
+    auto_error=False,
+    scheme_name="PortalSessionCookie",
+)
 
 
 @dataclass(frozen=True)
@@ -108,6 +121,7 @@ async def require_api_key(
     request: Request,
     api_key: str | None = Security(api_key_header),
     bearer: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    portal_cookie: str | None = Security(portal_cookie_scheme),
     settings: Settings = Depends(get_settings),
 ) -> Principal:
     # Prefer explicit API key header; then Authorization Bearer; then portal cookie.
@@ -141,8 +155,10 @@ async def require_api_key(
         request.state.principal = principal
         return principal
 
-    cookie_name = settings.portal_cookie_name or "zenith_portal_token"
-    cookie_token = (request.cookies.get(cookie_name) or "").strip()
+    cookie_name = settings.portal_cookie_name or PORTAL_COOKIE_SCHEME_NAME
+    # Prefer the Security-injected cookie (OpenAPI-declared name); fall back to
+    # the configured cookie name when operators override ZENITH_PORTAL_COOKIE_NAME.
+    cookie_token = (portal_cookie or request.cookies.get(cookie_name) or "").strip()
     if cookie_token:
         principal = _principal_from_portal_cookie(cookie_token, settings)
         if principal is None:
